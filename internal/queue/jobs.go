@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 const (
 	historyMax = 20
 	maxCopies  = 99
+	maxActive  = 50
 )
 
 // Request asks to print an upload.
@@ -47,6 +49,7 @@ type job struct {
 	pages  []int
 	opts   backend.Options
 	handle backend.Handle
+	cancel chan struct{} // closed when the job is canceled while printing
 }
 
 // Queue is a serial FIFO print queue served by one worker (Run).
@@ -120,6 +123,9 @@ func (q *Queue) snapshot(j *job) Job {
 // Submit validates the request and queues a job. The same Key returns the
 // same Job; an upload that was already taken gives ErrNotFound.
 func (q *Queue) Submit(r Request) (Job, error) {
+	if r.Key == "" {
+		return Job{}, ErrBadKey
+	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	mapKey := r.Visitor + "\x00" + r.Key
@@ -140,8 +146,11 @@ func (q *Queue) Submit(r Request) (Job, error) {
 	if err != nil {
 		return Job{}, ErrBadPages
 	}
+	if len(q.order) >= maxActive {
+		return Job{}, ErrQueueFull
+	}
 	if _, err := q.drafts.Take(r.Upload, r.Visitor); err != nil {
-		return Job{}, ErrNotFound
+		return Job{}, err
 	}
 	r.Opts.Copies = min(max(r.Opts.Copies, 1), maxCopies)
 	j := &job{
@@ -151,6 +160,7 @@ func (q *Queue) Submit(r Request) (Job, error) {
 			Created: q.now(),
 		},
 		key: mapKey, pdf: dr.PDF, pages: pages, opts: r.Opts,
+		cancel: make(chan struct{}),
 	}
 	q.jobs[j.ID] = j
 	q.keys[mapKey] = j.ID
@@ -226,21 +236,41 @@ func (q *Queue) Cancel(id, visitor string) error {
 	defer cancel()
 	caps, err := q.b.Caps(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrPrinter, err)
 	}
 	if !caps.CanCancel {
 		return ErrNotActive
 	}
 	if err := q.b.Cancel(ctx, h); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrPrinter, err)
 	}
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	if j.State == "printing" {
-		j.State = "canceled"
-		j.Finished = q.now()
+	if j.State != "printing" {
+		return ErrNotActive // the job ended while we talked to the printer
 	}
+	j.State = "canceled"
+	j.Finished = q.now()
+	close(j.cancel)
 	return nil
+}
+
+// drain ends every still-queued job as canceled (server stopping) and
+// deletes its files.
+func (q *Queue) drain() {
+	var files []string
+	q.mu.Lock()
+	for _, j := range append([]*job(nil), q.order...) {
+		if j.State == "queued" {
+			files = append(files, j.pdf)
+			j.State, j.Error, j.Finished = "canceled", "server_stopped", q.now()
+			q.finish(j, "canceled", "server_stopped")
+		}
+	}
+	q.mu.Unlock()
+	for _, f := range files {
+		_ = os.Remove(f)
+	}
 }
 
 // removeActive drops j from the active order; the lock must be held.

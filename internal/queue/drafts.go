@@ -19,6 +19,9 @@ var (
 	ErrForbidden = errors.New("queue: forbidden")
 	ErrBadPages  = errors.New("queue: invalid page selection")
 	ErrNotActive = errors.New("queue: job cannot be canceled")
+	ErrBadKey    = errors.New("queue: missing idempotency key")
+	ErrQueueFull = errors.New("queue: too many jobs waiting")
+	ErrPrinter   = errors.New("queue: printer error")
 )
 
 // Draft is an uploaded, not yet printed document. Its PDF file is owned by
@@ -120,6 +123,20 @@ func (d *Drafts) Delete(id, visitor string) error {
 	}
 	_ = os.Remove(dr.PDF)
 	return nil
+}
+
+// Purge deletes every draft and its file (used at shutdown).
+func (d *Drafts) Purge() {
+	d.mu.Lock()
+	files := make([]string, 0, len(d.m))
+	for id, dr := range d.m {
+		files = append(files, dr.PDF)
+		delete(d.m, id)
+	}
+	d.mu.Unlock()
+	for _, f := range files {
+		_ = os.Remove(f)
+	}
 }
 
 // Sweep deletes expired drafts and their files.

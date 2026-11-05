@@ -18,6 +18,7 @@ const (
 
 // Run serves the queue one job at a time until ctx is cancelled.
 func (q *Queue) Run(ctx context.Context) {
+	defer q.drain()
 	for {
 		if ctx.Err() != nil {
 			return
@@ -59,6 +60,9 @@ func (q *Queue) end(j *job, state, errKey string) {
 	q.mu.Unlock()
 }
 
+// isNetErr reports a network-level failure. context.DeadlineExceeded also
+// satisfies net.Error (Timeout() is true), so a Submit or Status timeout is
+// treated as the printer being unreachable.
 func isNetErr(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne)
@@ -73,6 +77,10 @@ func (q *Queue) process(ctx context.Context, j *job) {
 	sctx, cancel := context.WithTimeout(ctx, statusTimeout)
 	st, err := q.b.Status(sctx)
 	cancel()
+	if ctx.Err() != nil {
+		q.end(j, "canceled", "server_stopped")
+		return
+	}
 	if err != nil || st.State == backend.StateUnreachable {
 		q.end(j, "failed", "printer_unreachable")
 		return
@@ -80,11 +88,22 @@ func (q *Queue) process(ctx context.Context, j *job) {
 	cctx, cancel := context.WithTimeout(ctx, statusTimeout)
 	caps, err := q.b.Caps(cctx)
 	cancel()
+	// If the capabilities cannot be read we cannot tell whether the job can
+	// be tracked, so the job is treated as non-tracking and ends "sent".
 	canTrack := err == nil && caps.CanTrack
 
 	prep, err := prepare(ctx, j.pdf, j.pages, q.tmp)
 	if err != nil {
+		if ctx.Err() != nil {
+			q.end(j, "canceled", "server_stopped")
+			return
+		}
 		q.end(j, "failed", "conversion_failed")
+		return
+	}
+	if ctx.Err() != nil {
+		_ = os.Remove(prep)
+		q.end(j, "canceled", "server_stopped")
 		return
 	}
 	q.mu.Lock()
@@ -96,6 +115,11 @@ func (q *Queue) process(ctx context.Context, j *job) {
 	h, err := q.b.Submit(subCtx, prep, name, opts)
 	cancel()
 	if err != nil {
+		if ctx.Err() != nil {
+			// Shutting down mid-send: the printer may already have the job.
+			q.end(j, "sent", "")
+			return
+		}
 		key := "printer_error"
 		if isNetErr(err) {
 			key = "printer_unreachable"
@@ -120,7 +144,11 @@ func (q *Queue) track(ctx context.Context, j *job, h backend.Handle, poll, track
 		select {
 		case <-ctx.Done():
 			t.Stop()
-			q.end(j, "failed", "printer_error")
+			q.end(j, "sent", "") // shutting down; the printer has the job
+			return
+		case <-j.cancel:
+			t.Stop()
+			q.end(j, "canceled", "")
 			return
 		case <-t.C:
 		}

@@ -24,6 +24,7 @@ type fakeBackend struct {
 	entered   chan string   // receives the name on Submit entry (if non-nil)
 	gate      chan struct{} // Submit waits for it (if non-nil)
 	nextID    int
+	statusIn  chan struct{} // if set, Status signals it then blocks until ctx is done
 }
 
 func newFake() *fakeBackend {
@@ -39,7 +40,12 @@ func (f *fakeBackend) Caps(context.Context) (backend.Caps, error) {
 	return f.caps, nil
 }
 
-func (f *fakeBackend) Status(context.Context) (backend.Status, error) {
+func (f *fakeBackend) Status(ctx context.Context) (backend.Status, error) {
+	if f.statusIn != nil {
+		f.statusIn <- struct{}{}
+		<-ctx.Done()
+		return backend.Status{}, ctx.Err()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return backend.Status{State: f.state}, nil
@@ -149,11 +155,12 @@ func (e *env) submit(t *testing.T, visitor, name string, key string) (Job, Draft
 	return j, dr
 }
 
-func (e *env) run(t *testing.T) {
+func (e *env) run(t *testing.T) (context.CancelFunc, <-chan struct{}) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { e.q.Run(ctx); close(done) }()
 	t.Cleanup(func() { cancel(); <-done })
+	return cancel, done
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {
@@ -307,6 +314,9 @@ func TestQueueVisibilityAndCancel(t *testing.T) {
 	b, _ := e.submit(t, "bob", "bob.pdf", "kb")
 	c, _ := e.submit(t, "alice", "alice2.pdf", "kc")
 
+	if l := e.q.List("alice", false); len(l) != 3 {
+		t.Fatalf("want 3 active jobs, got %d", len(l))
+	}
 	for _, v := range e.q.List("alice", false) {
 		switch v.ID {
 		case a.ID, c.ID:
@@ -365,6 +375,13 @@ func TestQueueVisibilityAndCancel(t *testing.T) {
 	e.b.mu.Unlock()
 	if n != 1 {
 		t.Fatalf("backend cancel calls %d", n)
+	}
+	// history: bob sees alice's job without its name, alice sees it
+	if h := e.q.History("bob", false); len(h) < 1 || h[0].ID != a.ID || h[0].Name != "" || h[0].Mine {
+		t.Fatalf("history masking: %+v", h)
+	}
+	if h := e.q.History("alice", false); len(h) < 1 || h[0].Name != "alice.pdf" || !h[0].Mine {
+		t.Fatalf("own history: %+v", h)
 	}
 }
 
@@ -506,5 +523,187 @@ func TestHistoryBoundedAndKeysPruned(t *testing.T) {
 	}
 	if h := e.q.History("v", true); h[0].ID != last.ID {
 		t.Fatal("history not newest first")
+	}
+}
+
+func (e *env) tmpEmpty(t *testing.T) {
+	t.Helper()
+	waitFor(t, "temp dir empty", func() bool {
+		entries, _ := os.ReadDir(e.tmp)
+		return len(entries) == 0
+	})
+}
+
+func TestShutdownDrainsQueuedJobs(t *testing.T) {
+	e := newEnv(t)
+	e.b.entered = make(chan string, 2)
+	e.b.gate = make(chan struct{}) // never released: Submit ends with ctx
+	a, _ := e.submit(t, "v", "a", "ka")
+	b, drb := e.submit(t, "v", "b", "kb")
+	cancel, done := e.run(t)
+	<-e.b.entered
+	cancel()
+	<-done
+	// Submit was interrupted: the printer may have the job.
+	if j := e.finished(t, a.ID); j.State != "sent" {
+		t.Fatalf("in-flight: %+v", j)
+	}
+	jb := e.finished(t, b.ID)
+	if jb.State != "canceled" || jb.Error != "server_stopped" {
+		t.Fatalf("queued: %+v", jb)
+	}
+	if exists(drb.PDF) {
+		t.Fatal("queued file kept")
+	}
+	e.tmpEmpty(t)
+}
+
+func TestShutdownDuringStatusCancels(t *testing.T) {
+	e := newEnv(t)
+	e.b.statusIn = make(chan struct{}, 1)
+	a, _ := e.submit(t, "v", "a", "ka")
+	cancel, _ := e.run(t)
+	<-e.b.statusIn
+	cancel()
+	if j := e.finished(t, a.ID); j.State != "canceled" || j.Error != "server_stopped" {
+		t.Fatalf("%+v", j)
+	}
+	e.tmpEmpty(t)
+}
+
+func TestShutdownDuringPrepareCancels(t *testing.T) {
+	e := newEnv(t)
+	in := make(chan struct{}, 1)
+	e.q.prepare = func(ctx context.Context, _ string, _ []int, _ string) (string, error) {
+		in <- struct{}{}
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	a, _ := e.submit(t, "v", "a", "ka")
+	cancel, _ := e.run(t)
+	<-in
+	cancel()
+	if j := e.finished(t, a.ID); j.State != "canceled" || j.Error != "server_stopped" {
+		t.Fatalf("%+v", j)
+	}
+	e.tmpEmpty(t)
+}
+
+func TestShutdownWhilePrintingEndsSent(t *testing.T) {
+	e := newEnv(t)
+	a, _ := e.submit(t, "v", "a", "ka")
+	cancel, _ := e.run(t)
+	e.waitPrinting(t, "v")
+	cancel()
+	if j := e.finished(t, a.ID); j.State != "sent" {
+		t.Fatalf("%+v", j)
+	}
+	e.tmpEmpty(t)
+}
+
+func TestPrepareErrorDeletesFiles(t *testing.T) {
+	e := newEnv(t)
+	e.q.prepare = func(context.Context, string, []int, string) (string, error) { return "", errors.New("gs") }
+	a, _ := e.submit(t, "v", "a", "ka")
+	e.run(t)
+	if j := e.finished(t, a.ID); j.Error != "conversion_failed" {
+		t.Fatalf("%+v", j)
+	}
+	e.tmpEmpty(t)
+}
+
+func TestCancelPrintingDeletesPrepFile(t *testing.T) {
+	e := newEnv(t)
+	a, _ := e.submit(t, "v", "a", "ka")
+	e.run(t)
+	e.waitPrinting(t, "v")
+	if err := e.q.Cancel(a.ID, "v"); err != nil {
+		t.Fatal(err)
+	}
+	if j := e.finished(t, a.ID); j.State != "canceled" {
+		t.Fatalf("%+v", j)
+	}
+	e.tmpEmpty(t)
+}
+
+func TestSubmitEmptyKey(t *testing.T) {
+	e := newEnv(t)
+	dr := e.upload(t, "v", "a", 2)
+	if _, err := e.q.Submit(Request{Upload: dr.ID, Visitor: "v"}); !errors.Is(err, ErrBadKey) {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := e.d.Get(dr.ID, "v"); err != nil {
+		t.Fatal("draft consumed")
+	}
+}
+
+func TestQueueFull(t *testing.T) {
+	e := newEnv(t)
+	for i := 0; i < maxActive; i++ {
+		e.submit(t, "v", "n", string(rune('A'+i)))
+	}
+	dr := e.upload(t, "v", "n", 2)
+	if _, err := e.q.Submit(Request{Upload: dr.ID, Key: "extra", Visitor: "v"}); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := e.d.Get(dr.ID, "v"); err != nil {
+		t.Fatal("draft consumed when queue full")
+	}
+}
+
+func TestConcurrentSameKeySubmit(t *testing.T) {
+	e := newEnv(t)
+	dr := e.upload(t, "v", "a", 2)
+	ids := make(chan string, 8)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			j, err := e.q.Submit(Request{Upload: dr.ID, Key: "k", Visitor: "v"})
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			ids <- j.ID
+		}()
+	}
+	wg.Wait()
+	close(ids)
+	first := ""
+	for id := range ids {
+		if first == "" {
+			first = id
+		} else if id != first {
+			t.Fatalf("different jobs %s %s", first, id)
+		}
+	}
+	if n := len(e.q.List("v", true)); n != 1 {
+		t.Fatalf("%d jobs", n)
+	}
+}
+
+func TestExpiryAtExactlyTTL(t *testing.T) {
+	e := newEnv(t)
+	dr := e.upload(t, "v", "a", 2)
+	e.c.t = e.c.t.Add(15*time.Minute - time.Nanosecond)
+	if _, err := e.d.Get(dr.ID, "v"); err != nil {
+		t.Fatal(err)
+	}
+	e.c.t = e.c.t.Add(time.Nanosecond)
+	if _, err := e.d.Get(dr.ID, "v"); !errors.Is(err, ErrExpired) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestDraftsPurge(t *testing.T) {
+	e := newEnv(t)
+	dr := e.upload(t, "v", "a", 2)
+	e.d.Purge()
+	if exists(dr.PDF) {
+		t.Fatal("file kept")
+	}
+	if _, err := e.d.Get(dr.ID, "v"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("got %v", err)
 	}
 }
