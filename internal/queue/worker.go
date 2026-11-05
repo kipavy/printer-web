@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"errors"
+	"log"
 	"net"
 	"os"
 	"time"
@@ -68,6 +69,22 @@ func isNetErr(err error) bool {
 	return errors.As(err, &ne)
 }
 
+// resolveOrientation replaces "auto" (or empty) with the document's own
+// orientation when it is known, so backends that cannot see the page
+// geometry (such as a command) get portrait or landscape.
+func resolveOrientation(o backend.Options, orient string) backend.Options {
+	if (o.Orientation == "" || o.Orientation == "auto") && orient != "" {
+		o.Orientation = orient
+	}
+	return o
+}
+
+// fail ends j with errKey and logs why (never the file name).
+func (q *Queue) fail(j *job, state, errKey string, err error) {
+	log.Printf("job %s: %s (%s): %v", j.ID, state, errKey, err)
+	q.end(j, state, errKey)
+}
+
 func (q *Queue) process(ctx context.Context, j *job) {
 	q.mu.Lock()
 	prepare, poll, trackMax := q.prepare, q.poll, q.trackMax
@@ -78,11 +95,14 @@ func (q *Queue) process(ctx context.Context, j *job) {
 	st, err := q.b.Status(sctx)
 	cancel()
 	if ctx.Err() != nil {
-		q.end(j, "canceled", "server_stopped")
+		q.fail(j, "canceled", "server_stopped", ctx.Err())
 		return
 	}
 	if err != nil || st.State == backend.StateUnreachable {
-		q.end(j, "failed", "printer_unreachable")
+		if err == nil {
+			err = errors.New("printer state is unreachable")
+		}
+		q.fail(j, "failed", "printer_unreachable", err)
 		return
 	}
 	cctx, cancel := context.WithTimeout(ctx, statusTimeout)
@@ -91,24 +111,27 @@ func (q *Queue) process(ctx context.Context, j *job) {
 	// If the capabilities cannot be read we cannot tell whether the job can
 	// be tracked, so the job is treated as non-tracking and ends "sent".
 	canTrack := err == nil && caps.CanTrack
+	if err != nil {
+		log.Printf("job %s: cannot read printer capabilities, not tracking: %v", j.ID, err)
+	}
 
 	prep, err := prepare(ctx, j.pdf, j.pages, q.tmp)
 	if err != nil {
 		if ctx.Err() != nil {
-			q.end(j, "canceled", "server_stopped")
+			q.fail(j, "canceled", "server_stopped", err)
 			return
 		}
-		q.end(j, "failed", "conversion_failed")
+		q.fail(j, "failed", "conversion_failed", err)
 		return
 	}
 	if ctx.Err() != nil {
 		_ = os.Remove(prep)
-		q.end(j, "canceled", "server_stopped")
+		q.fail(j, "canceled", "server_stopped", ctx.Err())
 		return
 	}
 	q.mu.Lock()
 	j.prep, j.State = prep, "sending"
-	opts, name := j.opts, j.Name
+	opts, name := resolveOrientation(j.opts, j.orient), j.Name
 	q.mu.Unlock()
 
 	subCtx, cancel := context.WithTimeout(ctx, submitTimeout)
@@ -117,6 +140,7 @@ func (q *Queue) process(ctx context.Context, j *job) {
 	if err != nil {
 		if ctx.Err() != nil {
 			// Shutting down mid-send: the printer may already have the job.
+			log.Printf("job %s: shutting down while sending, ended as sent: %v", j.ID, err)
 			q.end(j, "sent", "")
 			return
 		}
@@ -124,7 +148,7 @@ func (q *Queue) process(ctx context.Context, j *job) {
 		if isNetErr(err) {
 			key = "printer_unreachable"
 		}
-		q.end(j, "failed", key)
+		q.fail(j, "failed", key, err)
 		return
 	}
 	q.mu.Lock()
@@ -168,7 +192,7 @@ func (q *Queue) track(ctx context.Context, j *job, h backend.Handle, poll, track
 				q.end(j, "done", "")
 				return
 			case backend.JobFailed:
-				q.end(j, "failed", "printer_error")
+				q.fail(j, "failed", "printer_error", errors.New("the printer aborted the job"))
 				return
 			case backend.JobCanceled:
 				q.end(j, "canceled", "")
@@ -176,6 +200,7 @@ func (q *Queue) track(ctx context.Context, j *job, h backend.Handle, poll, track
 			}
 		} // transient errors are retried
 		if time.Since(start) >= trackMax {
+			log.Printf("job %s: no final state after %v, ended as sent (last error: %v)", j.ID, trackMax, err)
 			q.end(j, "sent", "")
 			return
 		}

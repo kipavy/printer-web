@@ -48,6 +48,7 @@ type job struct {
 	prep   string // Prepare output, once created
 	pages  []int
 	opts   backend.Options
+	orient string // first page orientation, "" if unknown
 	handle backend.Handle
 	cancel chan struct{} // closed when the job is canceled while printing
 }
@@ -159,7 +160,7 @@ func (q *Queue) Submit(r Request) (Job, error) {
 			Pages: len(pages), Sheets: Sheets(len(pages), r.Opts.Copies, r.Opts.Sides),
 			Created: q.now(),
 		},
-		key: mapKey, pdf: dr.PDF, pages: pages, opts: r.Opts,
+		key: mapKey, pdf: dr.PDF, pages: pages, opts: r.Opts, orient: dr.Orientation,
 		cancel: make(chan struct{}),
 	}
 	q.jobs[j.ID] = j

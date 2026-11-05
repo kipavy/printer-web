@@ -20,6 +20,7 @@ type fakeBackend struct {
 	trackErrs int // transient errors before tracking succeeds
 	tracks    []backend.JobState
 	calls     []string // names submitted
+	opts      []backend.Options
 	canceled  []int
 	entered   chan string   // receives the name on Submit entry (if non-nil)
 	gate      chan struct{} // Submit waits for it (if non-nil)
@@ -68,6 +69,7 @@ func (f *fakeBackend) Submit(ctx context.Context, pdf, name string, o backend.Op
 		return backend.Handle{}, f.submitErr
 	}
 	f.calls = append(f.calls, name)
+	f.opts = append(f.opts, o)
 	f.nextID++
 	return backend.Handle{ID: f.nextID}, nil
 }

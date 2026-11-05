@@ -32,7 +32,9 @@ type Draft struct {
 	PDF               string
 	Pages             int
 	Coverage          []docs.Coverage
-	Created           time.Time
+	// Orientation of the first page: "portrait", "landscape" or "" (unknown).
+	Orientation string
+	Created     time.Time
 }
 
 // Drafts is an in-memory store of drafts with expiry.
