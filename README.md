@@ -2,7 +2,7 @@
 
 Print from your phone to the family printer: open a web page, pick a file, tap Print. Self-hosted, one small container, no app and no account.
 
-<p align="center"><img src="docs/screenshot.png" width="320" alt="printer-web on a phone"></p>
+<p align="center"><img src="docs/screenshot.jpg" width="800" alt="printer-web: preview and print options"></p>
 
 ## Features
 
