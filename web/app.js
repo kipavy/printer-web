@@ -159,11 +159,17 @@
     $("#tonerBox").hidden = sup.length === 0;
     $("#toner").innerHTML = sup.map((s) => {
       const col = supplyColor(s);
-      return '<div><span>' + esc(s.name) + '</span><span class="t"><i style="width:' + level(s) + "%;background:" + col + '"></i></span><span>' + level(s) + " %</span></div>";
+      return '<div><span>' + esc(supplyName(s)) + '</span><span class="t"><i style="width:' + level(s) + "%;background:" + col + '"></i></span><span>' + level(s) + " %</span></div>";
     }).join("");
   }
 
   const level = (s) => Math.max(0, Math.min(100, Number(s.level) || 0));
+  // Known colours get a translated name ("Jaune" rather than "Yellow Toner").
+  function supplyName(s) {
+    const k = "toner_" + String(s.color || "").toLowerCase();
+    const v = t(k);
+    return v && v !== k ? v : s.name;
+  }
   function supplyColor(s) {
     const c = String(s.color || "").toLowerCase();
     if (/^#[0-9a-f]{3,8}$/.test(c)) return c;
@@ -482,7 +488,7 @@
     if (c.ppm) add(t("ps_speed"), t("ps_speed_v", { n: c.ppm }) + (c.ppmColor ? " (" + t("ps_speed_c", { n: c.ppmColor }) + ")" : ""));
     const sup = (p.supplies || []);
     const supHtml = sup.length ? '<div class="label">' + esc(t("supplies")) + '</div><div class="sup">' + sup.map((s) =>
-      "<div><span>" + esc(s.name) + '</span><span class="t"><i style="width:' + level(s) + "%;background:" + supplyColor(s) + '"></i></span><span>' + (s.level >= 0 ? level(s) + " %" : "?") + "</span></div>").join("") + "</div>" : "";
+      "<div><span>" + esc(supplyName(s)) + '</span><span class="t"><i style="width:' + level(s) + "%;background:" + supplyColor(s) + '"></i></span><span>' + (s.level >= 0 ? level(s) + " %" : "?") + "</span></div>").join("") + "</div>" : "";
     const where = [c.model, S.cfg.location].filter(Boolean).join(", ");
     const help = crit ? '<div class="alert warn">' + esc(reasonHelp(crit)) + "</div>" : (p.state === "unreachable" ? '<div class="alert">' + esc(t("err.printer_unreachable")) + "</div>" : "");
     showSheet('<h2 id="dlgTitle">' + esc(title) + "</h2><p>" + esc(where || S.cfg.name) + "</p>" +
