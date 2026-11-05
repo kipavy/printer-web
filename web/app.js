@@ -146,7 +146,10 @@
     else if (crit) { state = "warn"; txt = t("reason." + crit); sub = trayTxt; }
     else if (p.state === "stopped") { state = "warn"; txt = t("st_stopped"); }
     else if (p.state === "printing") { state = "busy"; txt = t("st_printing"); }
-    else if (reasons().includes("toner-low")) { state = "warn"; sub = t("reason.toner-low"); }
+    else {
+      const low = ["toner-low", "media-low"].filter((r) => reasons().includes(r));
+      if (low.length) { state = "warn"; sub = low.map((r) => t("reason." + r)).join(" · "); }
+    }
     st.dataset.state = state;
     $("#statusTxt").textContent = txt;
     $("#statusSub").textContent = sub;
@@ -775,16 +778,28 @@
     if (handoff) S.uploading = true;
     renderPrinter();
     render();
-    await refreshPrinter();
+    // The printer status (slow with SNMP) loads alongside the preview.
+    const printerReady = refreshPrinter().catch(() => {});
     refreshJobs();
 
     if (handoff) {
       const name = qp.get("name") || "affiche-qr.png";
       history.replaceState(null, "", location.pathname);
-      const ok = await adoptDraft({ id: handoff, name: name, kind: qp.get("kind") || "image", pages: 0 });
-      S.uploading = false;
-      render();
-      if (ok) onPrint();
+      let ok = false;
+      try {
+        ok = await adoptDraft({ id: handoff, name: name, kind: qp.get("kind") || "image", pages: 0 });
+      } catch (e) {
+        ok = false;
+      } finally {
+        S.uploading = false;
+        render();
+      }
+      if (ok) {
+        await printerReady; // the print sheet checks for blocking reasons
+        onPrint();
+      }
+    } else {
+      await printerReady;
     }
 
     setInterval(() => { if (!document.hidden) refreshPrinter(); }, 10000);

@@ -1,9 +1,12 @@
 package backend
 
 import (
+	"context"
 	"net"
+	"os"
 	"reflect"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -19,8 +22,9 @@ func iv(n int64) snmp.Value  { return snmp.Value{Type: snmp.TypeInteger, Int: n}
 // percentages in the private MIB.
 func ricohVars() map[string]snmp.Value {
 	m := map[string]snmp.Value{
-		oidErrorState:                   {Type: snmp.TypeOctetString, Bytes: []byte{0}},
-		oidDeviceStatus:                 iv(2),
+		oidErrorState + ".1":            {Type: snmp.TypeOctetString, Bytes: []byte{0}},
+		oidDeviceStatus + ".1":          iv(2),
+		oidDeviceType + ".1":            {Type: snmp.TypeOID, OID: oidDevicePrinter},
 		"1.3.6.1.2.1.43.18.1.1.8.1.127": sv("Ready"),
 	}
 	for i, n := range []string{"Cyan Cartridge", "Magenta Cartridge", "Yellow Cartridge", "Black Cartridge", "Waste Cartridge"} {
@@ -114,14 +118,15 @@ func TestSNMPErrorStateReasons(t *testing.T) {
 		{[]byte{0x40}, []string{"media-empty"}, StateStopped},
 		{[]byte{0x20, 0x00}, []string{"toner-low"}, StateReady},
 		{[]byte{0x0c}, []string{"door-open", "media-jam"}, StateStopped},
-		{[]byte{0x01, 0xa0}, []string{"other", "input-tray-missing", "marker-supply-missing"}, StateReady},
-		{[]byte{0x40, 0x04}, []string{"media-empty"}, StateStopped}, // noPaper + inputTrayEmpty
+		{[]byte{0x01, 0xa0}, []string{"input-tray-missing", "marker-supply-missing"}, StateReady}, // serviceRequested: no key
+		{[]byte{0x40, 0x04}, []string{"media-empty", "media-needed"}, StateStopped},               // noPaper + inputTrayEmpty
+		{[]byte{0x00, 0x04}, []string{"media-needed"}, StateReady},                                // inputTrayEmpty alone: not blocking
 		{[]byte{0x00, 0x08}, []string{"output-area-full"}, StateReady},
 		{[]byte{0x00, 0x52}, nil, StateReady}, // outputTrayMissing, outputNearFull, overduePreventMaint: no key
 	}
 	for _, c := range cases {
 		v := ricohVars()
-		v[oidErrorState] = snmp.Value{Type: snmp.TypeOctetString, Bytes: c.bytes}
+		v[oidErrorState+".1"] = snmp.Value{Type: snmp.TypeOctetString, Bytes: c.bytes}
 		a := snmptest.New(t, v)
 		st := testReader(a).merge(ctx(t), Status{State: StateReady})
 		if !slices.Equal(st.Reasons, c.want) || st.State != c.state || len(st.Supplies) != 4 {
@@ -130,8 +135,8 @@ func TestSNMPErrorStateReasons(t *testing.T) {
 	}
 	// Printing stays printing; existing reasons are kept once.
 	v := ricohVars()
-	v[oidErrorState] = snmp.Value{Type: snmp.TypeOctetString, Bytes: []byte{0x40}}
-	v[oidDeviceStatus] = iv(5)
+	v[oidErrorState+".1"] = snmp.Value{Type: snmp.TypeOctetString, Bytes: []byte{0x40}}
+	v[oidDeviceStatus+".1"] = iv(5)
 	a := snmptest.New(t, v)
 	r := testReader(a)
 	st := r.merge(ctx(t), Status{State: StatePrinting, Reasons: []string{"media-empty"}})
@@ -142,7 +147,7 @@ func TestSNMPErrorStateReasons(t *testing.T) {
 
 func TestSNMPDeviceDown(t *testing.T) {
 	v := ricohVars()
-	v[oidDeviceStatus] = iv(5)
+	v[oidDeviceStatus+".1"] = iv(5)
 	a := snmptest.New(t, v)
 	if st := testReader(a).merge(ctx(t), Status{State: StateReady}); st.State != StateStopped {
 		t.Fatalf("got %+v", st)
@@ -200,7 +205,7 @@ func TestSNMPCached(t *testing.T) {
 func TestSNMPInBackends(t *testing.T) {
 	a := snmptest.New(t, ricohVars())
 	// command, no probe
-	cb, err := newCommand(config.Config{Backend: "command", Command: []string{"go"}, SNMP: a.Addr, SNMPCommunity: "public"})
+	cb, err := newCommand(config.Config{Backend: "command", Command: []string{os.Args[0]}, SNMP: a.Addr, SNMPCommunity: "public"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,5 +229,97 @@ func TestSNMPForIPPWithoutLevels(t *testing.T) {
 	st, err := b.Status(ctx(t))
 	if err != nil || len(st.Supplies) != 4 || st.Supplies[0].Level != 100 {
 		t.Fatalf("got %+v %v", st, err)
+	}
+}
+
+func TestSNMPClassAndClamp(t *testing.T) {
+	v := map[string]snmp.Value{
+		oidSupplyDesc + ".1.1":  sv("Toner C"),
+		oidSupplyType + ".1.1":  iv(1), // other: kept
+		oidSupplyClass + ".1.1": iv(3),
+		oidSupplyMax + ".1.1":   iv(100),
+		oidSupplyLevel + ".1.1": iv(150), // above max: clamped
+		oidSupplyDesc + ".1.2":  sv("Collector"),
+		oidSupplyType + ".1.2":  iv(2), // unknown, but a receptacle
+		oidSupplyClass + ".1.2": iv(4),
+		oidSupplyDesc + ".1.3":  sv("Waste-free toner"),
+		oidSupplyClass + ".1.3": iv(3), // class wins over the name
+		oidSupplyMax + ".1.3":   iv(200),
+		oidSupplyLevel + ".1.3": iv(50),
+	}
+	a := snmptest.New(t, v)
+	st := testReader(a).merge(ctx(t), Status{State: StateReady})
+	want := []Supply{{Name: "Toner C", Level: 100}, {Name: "Waste-free toner", Level: 25}}
+	if !reflect.DeepEqual(st.Supplies, want) {
+		t.Fatalf("got %+v", st.Supplies)
+	}
+}
+
+func TestSNMPRicohEmpty(t *testing.T) {
+	v := ricohVars()
+	v[oidRicohTonerPct+".2"] = iv(0)
+	a := snmptest.New(t, v)
+	st := testReader(a).merge(ctx(t), Status{State: StateReady})
+	if st.Supplies[1].Level != 0 || !slices.Equal(st.Reasons, []string{"toner-empty"}) {
+		t.Fatalf("got %+v", st)
+	}
+}
+
+func TestSNMPPrinterRowNotOne(t *testing.T) {
+	v := ricohVars()
+	delete(v, oidErrorState+".1")
+	delete(v, oidDeviceStatus+".1")
+	delete(v, oidDeviceType+".1")
+	v[oidDeviceType+".1"] = snmp.Value{Type: snmp.TypeOID, OID: "1.3.6.1.2.1.25.3.1.3"} // processor
+	v[oidDeviceStatus+".1"] = iv(5)
+	v[oidDeviceType+".3"] = snmp.Value{Type: snmp.TypeOID, OID: oidDevicePrinter}
+	v[oidDeviceStatus+".3"] = iv(2)
+	v[oidErrorState+".3"] = snmp.Value{Type: snmp.TypeOctetString, Bytes: []byte{0x04}}
+	a := snmptest.New(t, v)
+	st := testReader(a).merge(ctx(t), Status{State: StateReady})
+	if !slices.Equal(st.Reasons, []string{"media-jam"}) || st.State != StateStopped {
+		t.Fatalf("got %+v", st)
+	}
+	// No printer table: the device of type printer gives the status.
+	delete(v, oidErrorState+".3")
+	v[oidDeviceStatus+".3"] = iv(5)
+	a = snmptest.New(t, v)
+	st = testReader(a).merge(ctx(t), Status{State: StateReady})
+	if len(st.Reasons) != 0 || st.State != StateStopped {
+		t.Fatalf("got %+v", st)
+	}
+}
+
+func TestSNMPSlowAgent(t *testing.T) {
+	a := snmptest.New(t, ricohVars())
+	a.Delay.Store(int64(60 * time.Millisecond))
+	r := newSNMPReader(a.Addr, "public") // real timeouts
+	start := time.Now()
+	st := r.merge(ctx(t), Status{State: StateReady})
+	if len(st.Supplies) != 4 || st.Supplies[0].Level != 100 {
+		t.Fatalf("got %+v after %v, %d requests", st, time.Since(start), a.Requests.Load())
+	}
+	if n := a.Requests.Load(); n > 20 {
+		t.Fatalf("%d requests", n)
+	}
+}
+
+func TestSNMPPartialOnSupplyFailure(t *testing.T) {
+	v := ricohVars()
+	v[oidErrorState+".1"] = snmp.Value{Type: snmp.TypeOctetString, Bytes: []byte{0x40}}
+	a := snmptest.New(t, v)
+	// Answer the printer state, then go silent once the supplies are asked.
+	a.SetResponder(func(req *snmp.Packet) *snmp.Packet {
+		if strings.HasPrefix(req.Vars[0].OID, oidSupplyDesc) {
+			a.Silent.Store(true)
+		}
+		return nil
+	})
+	r := testReader(a)
+	c, cancel := context.WithTimeout(ctx(t), 10*time.Second)
+	defer cancel()
+	st := r.merge(c, Status{State: StateReady})
+	if !slices.Equal(st.Reasons, []string{"media-empty"}) || st.State != StateStopped || len(st.Supplies) != 0 {
+		t.Fatalf("got %+v", st)
 	}
 }
