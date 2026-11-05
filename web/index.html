@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e7c86">
+<title>printer-web</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <div class="mark" aria-hidden="true"><i class="c"></i><i class="m"></i><i class="y"></i><i class="k"></i></div>
+      <div class="names"><h1 id="pname">printer-web</h1><small id="pmodel"></small></div>
+    </div>
+    <button class="status" id="status" data-state="idle" type="button" data-i18n-aria="printer_state_aria">
+      <span class="dot" aria-hidden="true"></span><b id="statusTxt">…</b><span id="statusSub"></span>
+    </button>
+  </header>
+
+  <main class="grid">
+    <section class="card" aria-labelledby="docTitle">
+      <div class="in">
+        <div class="file">
+          <div class="meta">
+            <div class="label" id="docTitle" data-i18n="document"></div>
+            <div class="name"><span id="fname"></span></div>
+            <div class="sub" id="fsub"></div>
+          </div>
+          <label class="btn" for="file" id="chooseLbl" data-i18n="choose_file"></label>
+          <input id="file" class="sr" type="file" accept=".pdf,.ps,.txt,.heic,.heif,image/*,application/pdf,text/plain">
+        </div>
+        <div class="stage" id="stage">
+          <div class="pages" id="pages"></div>
+          <div class="drop" data-i18n="drop_here"></div>
+        </div>
+        <p class="hint" id="hint"></p>
+        <div class="notice" id="notice" role="alert" hidden></div>
+      </div>
+    </section>
+
+    <div class="side">
+      <section class="card" id="optsCard" data-i18n-aria="settings">
+        <div class="in opts">
+          <div class="opt" id="optColor">
+            <h3 data-i18n="color"></h3>
+            <div class="seg" role="group" data-i18n-aria="color" data-k="color">
+              <button type="button" aria-pressed="true" data-v="color"><span class="swatch" aria-hidden="true"><i class="c"></i><i class="m"></i><i class="y"></i></span><span data-i18n="color"></span></button>
+              <button type="button" aria-pressed="false" data-v="mono"><span class="swatch" aria-hidden="true"><i class="k"></i></span><span data-i18n="mono"></span><small data-i18n="mono_sub"></small></button>
+            </div>
+          </div>
+          <div class="opt" id="optSides">
+            <h3 data-i18n="sides"></h3>
+            <div class="seg" role="group" data-i18n-aria="sides" data-k="sides">
+              <button type="button" aria-pressed="true" data-v="one"><span data-i18n="one"></span><small data-i18n="one_sub"></small></button>
+              <button type="button" aria-pressed="false" data-v="long"><span data-i18n="duplex"></span><small data-i18n="long_sub"></small></button>
+              <button type="button" aria-pressed="false" data-v="short"><span data-i18n="duplex"></span><small data-i18n="short_sub"></small></button>
+            </div>
+          </div>
+          <div class="opt">
+            <h3 data-i18n="orient"></h3>
+            <div class="seg" role="group" data-i18n-aria="orient" data-k="orient">
+              <button type="button" aria-pressed="true" data-v="auto"><span data-i18n="auto"></span></button>
+              <button type="button" aria-pressed="false" data-v="portrait"><span data-i18n="portrait"></span></button>
+              <button type="button" aria-pressed="false" data-v="landscape"><span data-i18n="landscape"></span><small data-i18n="landscape_sub"></small></button>
+            </div>
+          </div>
+          <div class="opt row">
+            <h3 style="margin:0" data-i18n="copies"></h3>
+            <div class="stepper"><button type="button" id="minus" data-i18n-aria="copies_less">−</button><output id="copies" aria-live="polite">1</output><button type="button" id="plus" data-i18n-aria="copies_more">+</button></div>
+          </div>
+          <div class="opt">
+            <h3 data-i18n="pages"></h3>
+            <div class="chips">
+              <button type="button" class="chip" aria-pressed="true" id="allPages" data-i18n="all_pages"></button>
+              <button type="button" class="chip" aria-pressed="false" id="somePages" data-i18n="some_pages"></button>
+              <input class="pagesinput" id="pagesInput" data-i18n-ph="pages_ph" data-i18n-aria="pages_aria" autocomplete="off" hidden>
+            </div>
+            <div class="err" id="pagesErr" role="alert" hidden></div>
+          </div>
+          <details class="more" id="more">
+            <summary data-i18n="more"></summary>
+            <div class="opts">
+              <div class="opt" id="optQuality"><h3 data-i18n="quality"></h3>
+                <div class="seg" role="group" data-i18n-aria="quality" data-k="quality">
+                  <button type="button" aria-pressed="false" data-v="fast"><span data-i18n="q_fast"></span></button>
+                  <button type="button" aria-pressed="true" data-v="standard"><span data-i18n="q_standard"></span></button>
+                  <button type="button" aria-pressed="false" data-v="fine"><span data-i18n="q_fine"></span><small data-i18n="q_fine_sub"></small></button>
+                </div></div>
+              <div class="opt" id="optPaper"><h3><label for="paper" data-i18n="paper"></label></h3><select id="paper"></select></div>
+              <div class="opt" id="optTray"><h3><label for="tray" data-i18n="tray"></label></h3><select id="tray"></select></div>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="qTitle">
+        <div class="in">
+          <div class="qhead"><h2 id="qTitle" style="font-size:1.15rem" data-i18n="queue"></h2><button type="button" class="btn small" id="qToggle" aria-expanded="false" aria-controls="qlist" hidden data-i18n="queue_all"></button></div>
+          <p class="qsum" id="qsum" aria-live="polite"></p>
+          <ul class="qlist" id="qlist" hidden></ul>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="hTitle">
+        <div class="in">
+          <h2 id="hTitle" style="font-size:1.15rem" data-i18n="history"></h2>
+          <ul class="hist" id="hist"></ul>
+          <p class="hist-empty" id="histEmpty" data-i18n="history_empty" hidden></p>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="sTitle">
+        <div class="in">
+          <h2 id="sTitle" style="font-size:1.15rem;margin-bottom:10px" data-i18n="share_title"></h2>
+          <div class="share">
+            <div class="qr" id="qr" data-i18n-aria="qr_aria"></div>
+            <div style="min-width:0;flex:1">
+              <p style="margin:0 0 8px" data-i18n="share_text"></p>
+              <span class="addr" id="addr"></span>
+              <p class="hint" data-i18n="share_tip"></p>
+              <a class="link-qr" href="qr" data-i18n="qr_poster"></a>
+            </div>
+          </div>
+          <div id="tonerBox" hidden>
+            <div class="label" style="margin-top:16px" data-i18n="supplies"></div>
+            <div class="toner" id="toner"></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<div class="bar"><div class="wrap">
+  <div class="sum"><b id="sumTitle"></b><span id="sumSub"></span></div>
+  <button type="button" class="print" id="printBtn" data-i18n="print" disabled></button>
+</div></div>
+
+<div class="scrim" id="scrim" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlgTitle" id="dialog"></div>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script src="vendor/qrcode.min.js"></script>
+<script src="vendor/pdf.min.js"></script>
+<script src="i18n.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

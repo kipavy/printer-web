@@ -1,0 +1,9 @@
+{
+  "name": "printer-web",
+  "short_name": "Imprimante",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f6f7f9",
+  "theme_color": "#0e7c86",
+  "icons": [{"src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}]
+}
