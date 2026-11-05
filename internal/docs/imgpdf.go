@@ -114,7 +114,7 @@ func jpegImage(raw []byte) (*pdfImage, error) {
 	if cfg.Width <= 0 || cfg.Height <= 0 {
 		return nil, fmt.Errorf("invalid image size %dx%d", cfg.Width, cfg.Height)
 	}
-	im := &pdfImage{w: cfg.Width, h: cfg.Height, filter: "DCTDecode", data: raw, orient: 1}
+	im := &pdfImage{w: cfg.Width, h: cfg.Height, filter: "DCTDecode", data: jpegEnd(raw), orient: 1}
 	switch cfg.ColorModel {
 	case color.GrayModel:
 		im.cs = "DeviceGray"
@@ -134,6 +134,60 @@ func jpegImage(raw []byte) (*pdfImage, error) {
 	}
 	im.orient = orient
 	return im, nil
+}
+
+// jpegEnd cuts b just after the EOI that ends the image, dropping trailing
+// data such as the video of a motion photo. It walks the segments and skips
+// each scan's entropy-coded data (0xFF00 stuffing and RSTn markers stay in
+// the scan). Malformed input is returned unchanged.
+func jpegEnd(b []byte) []byte {
+	i := 2
+	for i+2 <= len(b) {
+		if b[i] != 0xFF {
+			return b
+		}
+		m := b[i+1]
+		switch {
+		case m == 0xFF: // fill byte
+			i++
+			continue
+		case m == 0xD9: // end of image
+			return b[:i+2]
+		case m == 0x01 || (m >= 0xD0 && m <= 0xD8):
+			i += 2
+			continue
+		}
+		if i+4 > len(b) {
+			return b
+		}
+		n := int(binary.BigEndian.Uint16(b[i+2:]))
+		if n < 2 || i+2+n > len(b) {
+			return b
+		}
+		i += 2 + n
+		if m != 0xDA {
+			continue
+		}
+		// Entropy-coded data runs until a marker other than RSTn.
+		for {
+			k := bytes.IndexByte(b[i:], 0xFF)
+			if k < 0 || i+k+1 >= len(b) {
+				return b
+			}
+			i += k
+			next := b[i+1]
+			if next == 0x00 || (next >= 0xD0 && next <= 0xD7) {
+				i += 2
+				continue
+			}
+			if next == 0xFF {
+				i++
+				continue
+			}
+			break
+		}
+	}
+	return b
 }
 
 // scanJPEGMarkers walks the header segments up to the scan and reports an

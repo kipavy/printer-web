@@ -43,7 +43,7 @@ func prepareArgs(pdf string, pages []int, out string) []string {
 	for i, p := range pages {
 		ps[i] = strconv.Itoa(p)
 	}
-	return append(gsBase(), "-sDEVICE=pdfwrite", "-sPageList="+strings.Join(ps, ","), "-sOutputFile="+out, pdf)
+	return append(gsBase(), "-sDEVICE=pdfwrite", noRotate, "-sPageList="+strings.Join(ps, ","), "-sOutputFile="+out, pdf)
 }
 
 // Prepare keeps only the selected pages and returns the new PDF.

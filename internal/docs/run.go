@@ -59,6 +59,9 @@ var run = func(ctx context.Context, argv []string) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
+// noRotate stops pdfwrite from turning pages by their text direction.
+const noRotate = "-dAutoRotatePages=/None"
+
 // gsBase are the flags every Ghostscript call starts with.
 func gsBase() []string { return []string{"gs", "-dSAFER", "-dBATCH", "-dNOPAUSE", "-q"} }
 

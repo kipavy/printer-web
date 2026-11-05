@@ -175,12 +175,12 @@ func TestNormalizeArgs(t *testing.T) {
 	if !reflect.DeepEqual(tiffArgs("a.tif", "a.pdf"), []string{"tiff2pdf", "-o", "a.pdf", "a.tif"}) {
 		t.Error("tiff argv")
 	}
-	wantFit := append(gsBase(), "-sDEVICE=pdfwrite", "-dFIXEDMEDIA", "-dPDFFitPage", "-dDEVICEWIDTHPOINTS=595.28", "-dDEVICEHEIGHTPOINTS=841.89", "-sOutputFile=o.pdf", "i.pdf")
+	wantFit := append(gsBase(), "-sDEVICE=pdfwrite", noRotate, "-dFIXEDMEDIA", "-dPDFFitPage", "-dDEVICEWIDTHPOINTS=595.28", "-dDEVICEHEIGHTPOINTS=841.89", "-sOutputFile=o.pdf", "i.pdf")
 	if !reflect.DeepEqual(tiffFitArgs("i.pdf", "o.pdf", 595.28, 841.89), wantFit) {
 		t.Error("tiff fit argv")
 	}
 	got, _ := normalizeArgs(KindPS, "in.ps", "out.pdf", 612, 792)
-	want := append(gsBase(), "-sDEVICE=pdfwrite", "-sOutputFile=out.pdf", "in.ps")
+	want := append(gsBase(), "-sDEVICE=pdfwrite", noRotate, "-sOutputFile=out.pdf", "in.ps")
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ps: %v", got)
 	}
@@ -193,7 +193,7 @@ func TestNormalizeArgs(t *testing.T) {
 	if !reflect.DeepEqual(enscriptArgs("a.txt", "a.ps", 595, 842), []string{"enscript", "-B", "-q", "--encoding=latin1", "--media=A4", "-o", "a.ps", "a.txt"}) {
 		t.Error("enscript argv")
 	}
-	if !reflect.DeepEqual(psToPDFArgs("a.ps", "a.pdf"), append(gsBase(), "-sDEVICE=pdfwrite", "-sOutputFile=a.pdf", "a.ps")) {
+	if !reflect.DeepEqual(psToPDFArgs("a.ps", "a.pdf"), append(gsBase(), "-sDEVICE=pdfwrite", noRotate, "-sOutputFile=a.pdf", "a.ps")) {
 		t.Error("ps2pdf argv")
 	}
 }
@@ -228,7 +228,7 @@ func TestGsAlwaysSafe(t *testing.T) {
 	all = append(all, a)
 	for _, f := range []string{"image/pwg-raster", "image/urf", "application/postscript", "application/vnd.hp-pcl"} {
 		for _, color := range []bool{true, false} {
-			a, err := convertArgs("a.pdf", f, color, "o")
+			a, err := convertArgs("a.pdf", f, color, 0, 0, "o")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -244,7 +244,7 @@ func TestGsAlwaysSafe(t *testing.T) {
 
 func TestConvertArgs(t *testing.T) {
 	dev := func(f string, color bool) string {
-		a, err := convertArgs("in.pdf", f, color, "out")
+		a, err := convertArgs("in.pdf", f, color, 0, 0, "out")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -271,18 +271,18 @@ func TestConvertArgs(t *testing.T) {
 	if dev("application/vnd.hp-pcl", true) != "pxlcolor" || dev("application/vnd.hp-pcl", false) != "pxlmono" {
 		t.Error("pcl devices")
 	}
-	a, _ := convertArgs("in.pdf", "image/pwg-raster", true, "out")
+	a, _ := convertArgs("in.pdf", "image/pwg-raster", true, 0, 0, "out")
 	if !contains(a, "-r300") {
 		t.Errorf("pwg must be 300 dpi: %v", a)
 	}
 	for _, f := range []string{"image/pwg-raster", "image/urf"} {
-		m, _ := convertArgs("in.pdf", f, false, "out")
-		c, _ := convertArgs("in.pdf", f, true, "out")
+		m, _ := convertArgs("in.pdf", f, false, 0, 0, "out")
+		c, _ := convertArgs("in.pdf", f, true, 0, 0, "out")
 		if !contains(m, "-dcupsColorSpace=18") || !contains(c, "-dcupsColorSpace=19") || !contains(m, "-dcupsBitsPerColor=8") || !contains(c, "-r300") || !contains(m, "-r300") {
 			t.Errorf("%s cups params: %v | %v", f, m, c)
 		}
 	}
-	if _, err := convertArgs("in.pdf", "text/html", true, "out"); err == nil {
+	if _, err := convertArgs("in.pdf", "text/html", true, 0, 0, "out"); err == nil {
 		t.Error("unknown format must fail")
 	}
 }
@@ -312,11 +312,11 @@ func TestPrepareArgs(t *testing.T) {
 
 func TestConvertPDFNoop(t *testing.T) {
 	abs, _ := filepath.Abs("x.pdf")
-	got, err := Convert(context.Background(), "x.pdf", "application/pdf", true, t.TempDir())
+	got, err := Convert(context.Background(), "x.pdf", "application/pdf", true, 595.28, 841.89, t.TempDir())
 	if err != nil || got != abs {
 		t.Fatalf("got %q %v", got, err)
 	}
-	if _, err := Convert(context.Background(), "x.pdf", "bogus/type", true, t.TempDir()); err == nil {
+	if _, err := Convert(context.Background(), "x.pdf", "bogus/type", true, 0, 0, t.TempDir()); err == nil {
 		t.Error("unknown format must fail")
 	}
 }
@@ -352,8 +352,9 @@ func TestHelperFail(t *testing.T) {
 
 func TestNormalizeWithFakeRunner(t *testing.T) {
 	var calls [][]string
-	old := run
-	defer func() { run = old }()
+	old, oldLook := run, lookPath
+	defer func() { run, lookPath = old, oldLook }()
+	lookPath = func(n string) (string, error) { return n, nil }
 	run = func(ctx context.Context, argv []string) ([]byte, error) {
 		calls = append(calls, argv)
 		return nil, nil
@@ -461,7 +462,7 @@ func TestPipelineIntegration(t *testing.T) {
 		{"application/vnd.hp-pcl", ") HP-PCL XL"},
 	} {
 		for _, color := range []bool{true, false} {
-			out, err := Convert(ctx, one, c.format, color, tmp)
+			out, err := Convert(ctx, one, c.format, color, 595.28, 841.89, tmp)
 			if err != nil {
 				t.Errorf("%s color=%v: %v", c.format, color, err)
 				continue

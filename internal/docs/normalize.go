@@ -7,6 +7,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -23,7 +24,7 @@ func normalizeArgs(k Kind, in, out string, paperW, paperH float64) ([]string, er
 	case KindPS:
 		// No -dFIXEDMEDIA/-dPDFFitPage: those only apply to PDF input and
 		// would clip or misplace PostScript that sets its own page size.
-		a := append(gsBase(), "-sDEVICE=pdfwrite")
+		a := append(gsBase(), "-sDEVICE=pdfwrite", noRotate)
 		return append(a, "-sOutputFile="+out, in), nil
 	}
 	return nil, fmt.Errorf("no direct conversion for kind %d", k)
@@ -34,12 +35,24 @@ func normalizeArgs(k Kind, in, out string, paperW, paperH float64) ([]string, er
 func tiffArgs(in, out string) []string { return []string{"tiff2pdf", "-o", out, in} }
 
 func tiffFitArgs(in, out string, paperW, paperH float64) []string {
-	a := append(gsBase(), "-sDEVICE=pdfwrite", "-dFIXEDMEDIA", "-dPDFFitPage",
+	a := append(gsBase(), "-sDEVICE=pdfwrite", noRotate, "-dFIXEDMEDIA", "-dPDFFitPage",
 		"-dDEVICEWIDTHPOINTS="+pt(paperW), "-dDEVICEHEIGHTPOINTS="+pt(paperH))
 	return append(a, "-sOutputFile="+out, in)
 }
 
-func heicArgs(in, out string) []string { return []string{"heif-convert", in, out} }
+// lookPath is exec.LookPath, replaced in tests.
+var lookPath = exec.LookPath
+
+// heicArgs uses heif-convert, or heif-dec (its newer name) when only that
+// one is installed.
+func heicArgs(in, out string) []string {
+	if _, err := lookPath("heif-convert"); err != nil {
+		if _, err := lookPath("heif-dec"); err == nil {
+			return []string{"heif-dec", in, out}
+		}
+	}
+	return []string{"heif-convert", in, out}
+}
 
 // enscriptMedia picks A4 unless the printer paper is about US Letter.
 func enscriptMedia(paperW, paperH float64) string {
@@ -54,7 +67,7 @@ func enscriptArgs(in, out string, paperW, paperH float64) []string {
 }
 
 func psToPDFArgs(in, out string) []string {
-	return append(gsBase(), "-sDEVICE=pdfwrite", "-sOutputFile="+out, in)
+	return append(gsBase(), "-sDEVICE=pdfwrite", noRotate, "-sOutputFile="+out, in)
 }
 
 // toLatin1 converts UTF-8 to ISO-8859-1, replacing unmappable runes with '?'.
@@ -203,6 +216,53 @@ func firstMediaBox(path string) (w, h float64, ok bool) {
 	buf := make([]byte, 64*1024)
 	n, _ := io.ReadFull(f, buf)
 	return parseMediaBox(buf[:n])
+}
+
+// FirstPageOrientation guesses the first page's orientation from the first
+// /MediaBox of the PDF (and a /Rotate of 90 or 270 in the same object):
+// "landscape", "portrait", or "" when it cannot tell (e.g. compressed
+// object streams).
+func FirstPageOrientation(pdf string) string {
+	f, err := os.Open(pdf)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	buf := make([]byte, 64*1024)
+	n, _ := io.ReadFull(f, buf)
+	return orientationOf(buf[:n])
+}
+
+func orientationOf(b []byte) string {
+	w, h, ok := parseMediaBox(b)
+	if !ok || w == h {
+		return ""
+	}
+	land := w > h
+	// The object holding the MediaBox: from the previous "obj" to "endobj".
+	i := bytes.Index(b, []byte("/MediaBox"))
+	start := bytes.LastIndex(b[:i], []byte(" obj"))
+	end := bytes.Index(b[i:], []byte("endobj"))
+	if start < 0 {
+		start = 0
+	}
+	if end < 0 {
+		end = len(b) - i
+	}
+	obj := b[start : i+end]
+	if j := bytes.Index(obj, []byte("/Rotate")); j >= 0 {
+		f := strings.Fields(string(obj[j+len("/Rotate") : min(len(obj), j+len("/Rotate")+16)]))
+		if len(f) > 0 {
+			r := strings.TrimRight(f[0], "/>]")
+			if n, err := strconv.Atoi(r); err == nil && ((n%180)+180)%180 == 90 {
+				land = !land
+			}
+		}
+	}
+	if land {
+		return "landscape"
+	}
+	return "portrait"
 }
 
 func parseMediaBox(b []byte) (w, h float64, ok bool) {

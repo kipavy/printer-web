@@ -38,8 +38,20 @@ func convertExt(format string) string {
 	return ".out"
 }
 
-// convertArgs builds the gs argv for a non-PDF output format.
-func convertArgs(pdf, format string, color bool, out string) ([]string, error) {
+// fitArgs scales every page onto the paper, given in portrait.
+func fitArgs(paperW, paperH float64) []string {
+	if paperW <= 0 || paperH <= 0 {
+		return nil
+	}
+	if paperW > paperH {
+		paperW, paperH = paperH, paperW
+	}
+	return []string{"-dFIXEDMEDIA", "-dPDFFitPage", "-dDEVICEWIDTHPOINTS=" + pt(paperW), "-dDEVICEHEIGHTPOINTS=" + pt(paperH)}
+}
+
+// convertArgs builds the gs argv for a non-PDF output format. extra flags
+// (such as duplex settings) go just before the output file.
+func convertArgs(pdf, format string, color bool, paperW, paperH float64, out string, extra ...string) ([]string, error) {
 	a := gsBase()
 	dpi := "-r" + strconv.Itoa(rasterDPI)
 	switch format {
@@ -63,12 +75,16 @@ func convertArgs(pdf, format string, color bool, out string) ([]string, error) {
 	default:
 		return nil, fmt.Errorf("unsupported output format %q", format)
 	}
+	a = append(a, fitArgs(paperW, paperH)...)
+	a = append(a, extra...)
 	return append(a, "-sOutputFile="+out, pdf), nil
 }
 
 // Convert renders the PDF into the printer's format and returns a file path
 // (callers stat it for the exact size). application/pdf returns pdf itself.
-func Convert(ctx context.Context, pdf, format string, color bool, tmp string) (string, error) {
+// Other formats are fitted onto the paperW x paperH sheet (points; 0 keeps
+// the page size). extra are additional Ghostscript flags.
+func Convert(ctx context.Context, pdf, format string, color bool, paperW, paperH float64, tmp string, extra ...string) (string, error) {
 	pdf, err := filepath.Abs(pdf)
 	if err != nil {
 		return "", err
@@ -80,7 +96,7 @@ func Convert(ctx context.Context, pdf, format string, color bool, tmp string) (s
 	if err != nil {
 		return "", err
 	}
-	argv, err := convertArgs(pdf, format, color, out)
+	argv, err := convertArgs(pdf, format, color, paperW, paperH, out, extra...)
 	if err != nil {
 		removeQuiet(out)
 		return "", err
