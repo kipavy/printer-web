@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -42,6 +43,7 @@ type Config struct {
 	PrinterLocation string
 	Backend         string // ipp | cups | raw | command
 	PrinterURI      string
+	PrinterProbe    string // optional host:port checked by the command backend
 	TLSInsecure     bool
 	RawLanguage     string // ps | pcl
 	Command         []string
@@ -150,6 +152,7 @@ func Load(getenv func(string) string) (Config, error) {
 		PrinterLocation: l.str("PRINTER_LOCATION", ""),
 		Backend:         l.oneOf("PRINTER_BACKEND", "ipp", "ipp", "cups", "raw", "command"),
 		PrinterURI:      l.str("PRINTER_URI", ""),
+		PrinterProbe:    l.str("PRINTER_PROBE", ""),
 		TLSInsecure:     l.boolean("PRINTER_TLS_INSECURE", false),
 		RawLanguage:     l.oneOf("PRINTER_RAW_LANGUAGE", "ps", "ps", "pcl"),
 		DefaultLang:     l.oneOf("DEFAULT_LANG", "auto", "auto", "fr", "en"),
@@ -171,6 +174,22 @@ func Load(getenv func(string) string) (Config, error) {
 		l.fail("DRAFT_TTL", "must be a positive duration like 15m, got %q", v)
 	} else {
 		c.DraftTTL = d
+	}
+	if c.MaxUploadBytes <= 0 && l.err == nil {
+		l.fail("MAX_UPLOAD_MB", "must be greater than 0")
+	}
+	if c.PublicURL != "" {
+		c.PublicURL = strings.TrimRight(c.PublicURL, "/")
+		u, err := url.Parse(c.PublicURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+			l.fail("PUBLIC_URL", "must be an http:// or https:// address with a host, e.g. http://192.168.1.10:28431, got %q", c.PublicURL)
+		}
+	}
+	if c.PrinterProbe != "" {
+		h, p, err := net.SplitHostPort(c.PrinterProbe)
+		if n, perr := strconv.Atoi(p); err != nil || h == "" || perr != nil || n < 1 || n > 65535 {
+			l.fail("PRINTER_PROBE", "must be host:port, e.g. 192.168.1.50:9100, got %q", c.PrinterProbe)
+		}
 	}
 	c.Pricing = loadPricing(l)
 	if l.err != nil {
@@ -207,9 +226,18 @@ func loadPricing(l *loader) Pricing {
 func (c *Config) validateBackend(rawCmd string) error {
 	switch c.Backend {
 	case "ipp", "cups":
+		// http:// and https:// are accepted as aliases of ipp:// and ipps://.
 		u, err := url.Parse(c.PrinterURI)
-		if err != nil || (u.Scheme != "ipp" && u.Scheme != "ipps") || u.Host == "" {
-			return fmt.Errorf("PRINTER_URI must be an ipp:// or ipps:// URI for backend %q, got %q", c.Backend, c.PrinterURI)
+		ok := err == nil && u.Hostname() != ""
+		if ok {
+			switch u.Scheme {
+			case "ipp", "ipps", "http", "https":
+			default:
+				ok = false
+			}
+		}
+		if !ok {
+			return fmt.Errorf("PRINTER_URI must be an ipp:// or ipps:// URI for backend %q, e.g. ipp://192.168.1.50/ipp/print, got %q", c.Backend, c.PrinterURI)
 		}
 	case "raw":
 		u, err := url.Parse(c.PrinterURI)
@@ -226,7 +254,8 @@ func (c *Config) validateBackend(rawCmd string) error {
 		raw := strings.TrimSpace(rawCmd)
 		var argv []string
 		if err := json.Unmarshal([]byte(raw), &argv); err != nil {
-			return errors.New(`PRINTER_COMMAND must be a JSON array of strings, e.g. ["prog","{file}"]`)
+			return fmt.Errorf(`PRINTER_COMMAND must be a JSON array of strings, e.g. ["prog","{file}"], got %q. `+
+				`Hint: in an --env-file, write it without surrounding quotes; in compose YAML, wrap the whole value in single quotes`, raw)
 		}
 		if len(argv) == 0 || strings.TrimSpace(argv[0]) == "" {
 			return errors.New("PRINTER_COMMAND must be a non-empty JSON array whose first element is not empty")

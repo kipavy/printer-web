@@ -36,7 +36,10 @@ func TestBackendValidation(t *testing.T) {
 	}{
 		{"ipp ok", "ipp", "ipp://192.168.1.50/ipp/print", true},
 		{"ipps ok", "ipp", "ipps://printer.local:631/ipp/print", true},
-		{"ipp bad", "ipp", "http://printer.local", false},
+		{"ipp http alias", "ipp", "http://printer.local:631/ipp/print", true},
+		{"ipp https alias", "ipp", "https://printer.local/ipp/print", true},
+		{"ipp bad", "ipp", "ftp://printer.local", false},
+		{"ipp nohost", "ipp", "ipp:///ipp/print", false},
 		{"ipp empty", "ipp", "", false},
 		{"cups ok", "cups", "ipp://cups.local:631/printers/Q", true},
 		{"cups bad", "cups", "socket://printer.local", false},
@@ -149,5 +152,69 @@ func TestPricing(t *testing.T) {
 	}
 	if c, _ := Load(with("PRICE_SHEET", "0.02")); !c.Pricing.Enabled() {
 		t.Fatal("sheet alone enables")
+	}
+}
+
+func TestCommandParseErrorHint(t *testing.T) {
+	_, err := Load(env(map[string]string{"PRINTER_BACKEND": "command", "PRINTER_COMMAND": `'["lp","{file}"]'`}))
+	if err == nil {
+		t.Fatal("want error")
+	}
+	for _, want := range []string{`got "'[\"lp\",\"{file}\"]'"`, "--env-file", "single quotes"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q lacks %q", err, want)
+		}
+	}
+}
+
+func TestPublicURL(t *testing.T) {
+	base := map[string]string{"PRINTER_URI": "ipp://192.168.1.50/ipp/print"}
+	for in, want := range map[string]string{
+		"http://192.168.1.50:28431/": "http://192.168.1.50:28431",
+		"https://printer.local//":    "https://printer.local",
+		"http://printer.local:28431": "http://printer.local:28431",
+		"192.168.1.50:28431":         "",
+		"ftp://printer.local":        "",
+		"http://":                    "",
+		"printer.local":              "",
+	} {
+		base["PUBLIC_URL"] = in
+		c, err := Load(env(base))
+		if want == "" {
+			if err == nil || !strings.Contains(err.Error(), "PUBLIC_URL") {
+				t.Errorf("%q: err = %v", in, err)
+			}
+			continue
+		}
+		if err != nil || c.PublicURL != want {
+			t.Errorf("%q: %q %v", in, c.PublicURL, err)
+		}
+	}
+}
+
+func TestMaxUploadPositive(t *testing.T) {
+	_, err := Load(env(map[string]string{"PRINTER_URI": "ipp://192.168.1.50/ipp/print", "MAX_UPLOAD_MB": "0"}))
+	if err == nil || !strings.Contains(err.Error(), "MAX_UPLOAD_MB") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestPrinterProbe(t *testing.T) {
+	for in, ok := range map[string]bool{
+		"192.168.1.50:9100":   true,
+		"printer.local:9100":  true,
+		"[::1]:9100":          true,
+		"192.168.1.50":        false,
+		":9100":               false,
+		"printer.local:x":     false,
+		"printer.local:70000": false,
+	} {
+		c, err := Load(env(map[string]string{"PRINTER_BACKEND": "command", "PRINTER_COMMAND": `["true"]`, "PRINTER_PROBE": in}))
+		if (err == nil) != ok {
+			t.Errorf("%q: err = %v", in, err)
+		}
+		if ok && c.PrinterProbe != in {
+			t.Errorf("%q: got %q", in, c.PrinterProbe)
+		}
 	}
 }
