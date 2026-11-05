@@ -98,7 +98,7 @@ func New(cfg config.Config) (Backend, error) {
 	case "raw":
 		return newRaw(cfg), nil
 	case "command":
-		return newCommand(cfg), nil
+		return newCommand(cfg)
 	}
 	return nil, fmt.Errorf("backend: unknown backend %q", cfg.Backend)
 }
@@ -133,35 +133,56 @@ func samePath(a, b string) bool {
 	return err1 == nil && err2 == nil && aa == bb
 }
 
-// cache holds one value per key for a fixed TTL.
+// clampCopies bounds the copy count to 1..99.
+func clampCopies(n int) int { return min(max(n, 1), 99) }
+
+const failTTL = 3 * time.Second
+
+// cache holds one result per key. Concurrent callers for the same key share
+// one fetch; successes live for ttl, failures for failTTL.
 type cache struct {
 	mu  sync.Mutex
 	ttl time.Duration
 	now func() time.Time
-	m   map[string]cacheEntry
+	m   map[string]*cacheEntry
 }
 
 type cacheEntry struct {
-	at time.Time
-	v  any
+	mu  sync.Mutex // held during a fetch
+	ok  bool
+	at  time.Time
+	v   any
+	err error
 }
 
 func newCache(ttl time.Duration) *cache {
-	return &cache{ttl: ttl, now: time.Now, m: map[string]cacheEntry{}}
+	return &cache{ttl: ttl, now: time.Now, m: map[string]*cacheEntry{}}
 }
 
-func (c *cache) get(key string) (any, bool) {
+// do returns the cached result for key or runs fetch. Errors caused by the
+// caller's own cancelled ctx are not cached.
+func (c *cache) do(ctx context.Context, key string, fetch func() (any, error)) (any, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	e, ok := c.m[key]
-	if !ok || c.now().Sub(e.at) >= c.ttl {
-		return nil, false
+	e := c.m[key]
+	if e == nil {
+		e = &cacheEntry{}
+		c.m[key] = e
 	}
-	return e.v, true
-}
+	c.mu.Unlock()
 
-func (c *cache) put(key string, v any) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.m[key] = cacheEntry{at: c.now(), v: v}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ttl := c.ttl
+	if e.err != nil {
+		ttl = failTTL
+	}
+	if e.ok && c.now().Sub(e.at) < ttl {
+		return e.v, e.err
+	}
+	v, err := fetch()
+	if err != nil && ctx.Err() != nil {
+		return v, err
+	}
+	e.ok, e.at, e.v, e.err = true, c.now(), v, err
+	return v, err
 }

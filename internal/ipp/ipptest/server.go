@@ -30,6 +30,7 @@ type Job struct {
 	script   []int
 	polls    int
 	override bool // state fixed by Cancel-Job or SetJobState
+	purged   bool // forgotten by the printer: Get/Cancel answer not-found
 }
 
 type failure struct {
@@ -327,7 +328,7 @@ func (s *Server) answer(req *ipp.Message, doc []byte, r *http.Request) *ipp.Mess
 			return status(ipp.StatusBadRequest, "missing job-id")
 		}
 		j := s.job(id)
-		if j == nil {
+		if j == nil || j.purged {
 			return status(ipp.StatusNotFound, fmt.Sprintf("job %d not found", id))
 		}
 		if req.Code == ipp.OpCancelJob {
@@ -483,4 +484,14 @@ func inferTag(name string, v any) byte {
 		return ipp.TagLanguage
 	}
 	return ipp.TagKeyword
+}
+
+// PurgeJob makes the printer forget a job, as real printers do with finished
+// jobs: Get-Job-Attributes and Cancel-Job then answer not-found.
+func (s *Server) PurgeJob(id int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if j := s.job(id); j != nil {
+		j.purged = true
+	}
 }
