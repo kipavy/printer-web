@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/png"
@@ -15,6 +16,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/kipavy/printer-web/internal/config"
@@ -337,6 +339,9 @@ func TestHelperFail(t *testing.T) {
 	if os.Getenv("DOCS_HELPER") != "1" {
 		return
 	}
+	if os.Getenv("DOCS_HELPER_MODE") == "sleep" {
+		time.Sleep(30 * time.Second)
+	}
 	if os.Getenv("DOCS_HELPER_MODE") == "stdout" {
 		os.Stdout.WriteString("Error: /undefined in foo\n")
 		os.Exit(1)
@@ -591,5 +596,55 @@ func TestNormalizeFlattensPNG(t *testing.T) {
 	}
 	if m, _ := filepath.Glob(filepath.Join(tmp, "flat-*")); len(m) != 0 {
 		t.Errorf("flattened copy not removed: %v", m)
+	}
+}
+
+func chunk(typ string, data []byte) []byte {
+	var b bytes.Buffer
+	binary.Write(&b, binary.BigEndian, uint32(len(data)))
+	b.WriteString(typ)
+	b.Write(data)
+	binary.Write(&b, binary.BigEndian, crc32.ChecksumIEEE(append([]byte(typ), data...)))
+	return b.Bytes()
+}
+
+func ihdrPNG(w, h uint32, colorType byte, extra ...[]byte) []byte {
+	ihdr := make([]byte, 13)
+	binary.BigEndian.PutUint32(ihdr, w)
+	binary.BigEndian.PutUint32(ihdr[4:], h)
+	ihdr[8], ihdr[9] = 8, colorType
+	b := append([]byte("\x89PNG\r\n\x1a\n"), chunk("IHDR", ihdr)...)
+	for _, e := range extra {
+		b = append(b, e...)
+	}
+	return append(b, chunk("IDAT", []byte{0})...)
+}
+
+func TestFlattenPNGBounds(t *testing.T) {
+	tmp := t.TempDir()
+	huge := write(t, "huge.png", ihdrPNG(60000, 60000, 6))
+	if out, err := flattenPNG(huge, tmp); err == nil || out != "" || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("got %q %v", out, err)
+	}
+	// Opaque RGB with a bogus IDAT is returned unchanged without decoding.
+	rgb := write(t, "rgb.png", ihdrPNG(10, 10, 2))
+	if out, err := flattenPNG(rgb, tmp); err != nil || out != "" {
+		t.Fatalf("rgb: %q %v", out, err)
+	}
+	// RGB with tRNS must be decoded (here it fails on the bogus data).
+	trns := write(t, "trns.png", ihdrPNG(10, 10, 2, chunk("tRNS", []byte{0, 0, 0, 0, 0, 0})))
+	if _, err := flattenPNG(trns, tmp); err == nil {
+		t.Error("tRNS PNG must be decoded")
+	}
+}
+
+func TestRunWrapsDeadline(t *testing.T) {
+	t.Setenv("DOCS_HELPER", "1")
+	t.Setenv("DOCS_HELPER_MODE", "sleep")
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, err := run(ctx, []string{os.Args[0], "-test.run=TestHelperFail"})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v", err)
 	}
 }

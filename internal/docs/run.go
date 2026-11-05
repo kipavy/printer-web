@@ -40,14 +40,21 @@ var run = func(ctx context.Context, argv []string) ([]byte, error) {
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil {
-		msg := fmt.Sprintf("%s: %v", argv[0], err)
+		base := fmt.Errorf("%s: %w", argv[0], err)
+		if cerr := ctx.Err(); cerr != nil {
+			base = fmt.Errorf("%s: %w: %v", argv[0], cerr, err)
+		}
+		msg := ""
 		if s := tail(errb.Bytes(), maxTail); s != "" {
 			msg += "; stderr: " + s
 		}
 		if s := tail(out.Bytes(), maxTail); s != "" {
 			msg += "; stdout: " + s
 		}
-		return nil, fmt.Errorf("%s", msg)
+		if msg == "" {
+			return nil, base
+		}
+		return nil, fmt.Errorf("%w%s", base, msg)
 	}
 	return out.Bytes(), nil
 }

@@ -3,11 +3,13 @@ package docs
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/png"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -72,6 +74,35 @@ func toLatin1(b []byte) []byte {
 	return out
 }
 
+// maxPNGPixels bounds decoding memory (100 megapixels).
+const maxPNGPixels = 100_000_000
+
+// noAlphaPNG reports whether the PNG (positioned anywhere) is grey or RGB
+// without a tRNS chunk, so it cannot have transparency. Unknown means false.
+func noAlphaPNG(f *os.File) bool {
+	var hdr [26]byte
+	if _, err := f.ReadAt(hdr[:], 0); err != nil {
+		return false
+	}
+	if ct := hdr[25]; ct != 0 && ct != 2 {
+		return false
+	}
+	off := int64(8)
+	for {
+		var ch [8]byte
+		if _, err := f.ReadAt(ch[:], off); err != nil {
+			return false
+		}
+		switch string(ch[4:8]) {
+		case "tRNS":
+			return false
+		case "IDAT":
+			return true
+		}
+		off += 12 + int64(binary.BigEndian.Uint32(ch[:4]))
+	}
+}
+
 // flattenPNG writes an opaque copy of a PNG that has transparency, drawn on
 // white (img2pdf would otherwise emit an alpha channel printers render black).
 // It returns "" when the file needs no change.
@@ -82,7 +113,20 @@ func flattenPNG(in, tmp string) (string, error) {
 	}
 	defer f.Close()
 	var magic [8]byte
-	if _, err := f.Read(magic[:]); err != nil || string(magic[:]) != "\x89PNG\r\n\x1a\n" {
+	if _, err := io.ReadFull(f, magic[:]); err != nil || string(magic[:]) != "\x89PNG\r\n\x1a\n" {
+		return "", nil
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return "", err
+	}
+	cfg, err := png.DecodeConfig(f)
+	if err != nil {
+		return "", err
+	}
+	if int64(cfg.Width)*int64(cfg.Height) > maxPNGPixels {
+		return "", fmt.Errorf("image too large (%dx%d pixels)", cfg.Width, cfg.Height)
+	}
+	if noAlphaPNG(f) {
 		return "", nil
 	}
 	if _, err := f.Seek(0, 0); err != nil {
