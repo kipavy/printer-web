@@ -44,6 +44,8 @@ type Config struct {
 	Backend         string // ipp | cups | raw | command
 	PrinterURI      string
 	PrinterProbe    string // optional host:port checked by the command backend
+	SNMP            string // optional host:port of the SNMP agent (port 161 by default)
+	SNMPCommunity   string
 	TLSInsecure     bool
 	RawLanguage     string // ps | pcl
 	Command         []string
@@ -153,6 +155,7 @@ func Load(getenv func(string) string) (Config, error) {
 		Backend:         l.oneOf("PRINTER_BACKEND", "ipp", "ipp", "cups", "raw", "command"),
 		PrinterURI:      l.str("PRINTER_URI", ""),
 		PrinterProbe:    l.str("PRINTER_PROBE", ""),
+		SNMPCommunity:   l.str("PRINTER_SNMP_COMMUNITY", "public"),
 		TLSInsecure:     l.boolean("PRINTER_TLS_INSECURE", false),
 		RawLanguage:     l.oneOf("PRINTER_RAW_LANGUAGE", "ps", "ps", "pcl"),
 		DefaultLang:     l.oneOf("DEFAULT_LANG", "auto", "auto", "fr", "en"),
@@ -190,6 +193,9 @@ func Load(getenv func(string) string) (Config, error) {
 		if n, perr := strconv.Atoi(p); err != nil || h == "" || perr != nil || n < 1 || n > 65535 {
 			l.fail("PRINTER_PROBE", "must be host:port, e.g. 192.168.1.50:9100, got %q", c.PrinterProbe)
 		}
+	}
+	if v := l.str("PRINTER_SNMP", ""); v != "" {
+		c.SNMP = snmpAddr(l, v)
 	}
 	c.Pricing = loadPricing(l)
 	if l.err != nil {
@@ -263,4 +269,22 @@ func (c *Config) validateBackend(rawCmd string) error {
 		c.Command = argv
 	}
 	return nil
+}
+
+// snmpAddr validates PRINTER_SNMP ("host" or "host:port") and returns
+// host:port, with port 161 when none is given.
+func snmpAddr(l *loader, v string) string {
+	host, port := v, "161"
+	if h, p, err := net.SplitHostPort(v); err == nil {
+		host, port = h, p
+	} else if ip := net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(v, "["), "]")); ip != nil {
+		host = ip.String() // bare IPv6 address, with or without brackets
+	}
+	n, err := strconv.Atoi(port)
+	if host == "" || strings.ContainsAny(host, " /?#@[]") || (strings.Contains(host, ":") && net.ParseIP(host) == nil) ||
+		err != nil || n < 1 || n > 65535 {
+		l.fail("PRINTER_SNMP", "must be host or host:port, e.g. 192.168.1.50 or 192.168.1.50:161, got %q", v)
+		return ""
+	}
+	return net.JoinHostPort(host, port)
 }

@@ -92,7 +92,7 @@
   }
 
   // ---------- printer status ----------
-  const CRITICAL = ["media-jam", "door-open", "media-empty", "media-needed", "toner-empty", "output-area-full", "input-tray-missing", "offline", "paused", "shutdown"];
+  const CRITICAL = ["media-jam", "door-open", "media-empty", "media-needed", "toner-empty", "output-area-full", "input-tray-missing", "marker-supply-missing", "offline", "paused", "shutdown"];
   const BLOCKING = ["media-empty", "media-jam", "door-open"];
   const baseReason = (r) => String(r).replace(/-(error|warning|report)$/, "");
   const known = (r) => t("reason." + r) !== "reason." + r;

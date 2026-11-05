@@ -61,6 +61,8 @@ Everything is set with environment variables.
 | `PRINTER_RAW_LANGUAGE` | `ps` | `raw` only: `ps` (PostScript) or `pcl`. |
 | `PRINTER_COMMAND` | empty | `command` only, required: a JSON array of strings, run without a shell. See the tokens below. |
 | `PRINTER_PROBE` | empty | `command` only, optional: `host:port` of the printer, e.g. `192.168.1.50:9100`. When set, the printer shows as unreachable when that port does not answer, and jobs are not sent to a printer that is off. |
+| `PRINTER_SNMP` | empty | `raw` and `command`, optional: `host` or `host:port` (port 161) of the printer's SNMP agent, e.g. `192.168.1.50`. Shows toner levels and paper, jam and cover alerts. Used by `ipp`/`cups` only for toner levels the printer does not report over IPP. If SNMP does not answer, the page just shows no levels. |
+| `PRINTER_SNMP_COMMUNITY` | `public` | SNMP v1 community for `PRINTER_SNMP`. |
 | `PRINTER_COLOR` | `false` | Declare a colour printer (`raw` and `command`; IPP printers report it themselves). |
 | `PRINTER_DUPLEX` | `false` | Declare two-sided printing (`raw` and `command`). |
 | `PRINTER_PAPERS` | `A4` | Comma-separated paper names (`raw` and `command`). The first is the default. No spaces inside a name. |
@@ -85,6 +87,8 @@ Booleans accept `true`/`false`, `1`/`0`, `yes`/`no`. Numbers use a decimal point
 - **CUPS queue (`cups`)**: you already run CUPS and want to reuse a queue. Use `ipp://<cups-host>:631/printers/<queue>`. It behaves like IPP.
 - **Raw port 9100 (`raw`)**: for PostScript or PCL printers without IPP. Use `PRINTER_URI=socket://<printer-ip>` (port 9100 by default) and `PRINTER_RAW_LANGUAGE=ps` or `pcl` (PCL means PCL XL, also called PCL 6). Declare what the printer can do with `PRINTER_COLOR`, `PRINTER_DUPLEX` and `PRINTER_PAPERS`; two-sided printing is requested in the job itself. Pages are scaled to the chosen paper. Progress is not tracked.
 - **Command (`command`)**: for anything else, such as a vendor tool or `lp`. You give a command line as a JSON array; printer-web runs it once per job with the PDF to print. Progress is not tracked: the job is "sent" when the command exits successfully. Set `PRINTER_PROBE` so the page knows when the printer is off.
+
+Toner levels and paper alerts for `command`/`raw` printers: set `PRINTER_SNMP` to the printer's address. printer-web then reads the toner levels and the paper, jam and cover alerts over SNMP v1 (standard Printer MIB, plus Ricoh's own toner table), every 10 seconds at most. An empty tray or a jam then shows on the page before anyone prints. Whether the printer is on is still decided by `PRINTER_PROBE` or the raw socket, never by SNMP.
 
 ### Setting `PRINTER_COMMAND`
 
@@ -182,6 +186,8 @@ cp examples/ricoh/.env.example .env      # set your printer's address after --pr
 docker run -d --name printer-web --restart unless-stopped \
   -p 28431:28431 --env-file .env printer-web-ricoh
 ```
+
+The example also sets `PRINTER_SNMP` to the same address, so the page shows the four toner levels and warns when the tray is empty or paper is jammed.
 
 ## Development
 

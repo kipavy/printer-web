@@ -28,16 +28,21 @@ type ippBackend struct {
 	tmp     string
 	cache   *cache
 	state   stateLog
+	snmp    *snmpReader // optional PRINTER_SNMP, used when IPP reports no levels
 }
 
 func newIPP(cfg config.Config) *ippBackend {
-	return &ippBackend{
+	b := &ippBackend{
 		cfg:     cfg,
 		client:  ipp.NewClient(cfg.PrinterURI, cfg.TLSInsecure),
 		convert: docs.Convert,
 		tmp:     os.TempDir(),
 		cache:   newCache(cacheTTL),
 	}
+	if cfg.SNMP != "" {
+		b.snmp = newSNMPReader(cfg.SNMP, cfg.SNMPCommunity)
+	}
+	return b
 }
 
 // Document formats in order of preference.
@@ -161,6 +166,12 @@ func (b *ippBackend) Status(ctx context.Context) (Status, error) {
 	b.state.note(nil)
 	st := v.(Status)
 	st.Reasons, st.Supplies = slices.Clone(st.Reasons), slices.Clone(st.Supplies)
+	// Some printers report no marker levels over IPP: try SNMP.
+	if b.snmp != nil && !slices.ContainsFunc(st.Supplies, func(s Supply) bool { return s.Level >= 0 }) {
+		if sup := b.snmp.read(ctx).supplies; len(sup) > 0 {
+			st.Supplies = sup
+		}
+	}
 	return st, nil
 }
 

@@ -218,3 +218,37 @@ func TestPrinterProbe(t *testing.T) {
 		}
 	}
 }
+
+func TestPrinterSNMP(t *testing.T) {
+	for in, want := range map[string]string{
+		"192.168.1.50":          "192.168.1.50:161",
+		"192.168.1.50:1161":     "192.168.1.50:1161",
+		"printer.local":         "printer.local:161",
+		"[::1]:161":             "[::1]:161",
+		"::1":                   "[::1]:161",
+		"[::1]":                 "[::1]:161",
+		":161":                  "",
+		"printer.local:x":       "",
+		"printer.local:0":       "",
+		"printer.local:7000000": "",
+		"http://192.168.1.50":   "",
+		"a b":                   "",
+		"1:2:3:zz":              "",
+	} {
+		c, err := Load(env(map[string]string{"PRINTER_BACKEND": "command", "PRINTER_COMMAND": `["true"]`, "PRINTER_SNMP": in}))
+		if (err == nil) != (want != "") {
+			t.Errorf("%q: err = %v", in, err)
+		}
+		if err == nil && c.SNMP != want {
+			t.Errorf("%q: got %q, want %q", in, c.SNMP, want)
+		}
+	}
+	c, err := Load(env(map[string]string{"PRINTER_BACKEND": "command", "PRINTER_COMMAND": `["true"]`}))
+	if err != nil || c.SNMP != "" || c.SNMPCommunity != "public" {
+		t.Fatalf("defaults: %+v %v", c, err)
+	}
+	c, _ = Load(env(map[string]string{"PRINTER_BACKEND": "command", "PRINTER_COMMAND": `["true"]`, "PRINTER_SNMP_COMMUNITY": "office"}))
+	if c.SNMPCommunity != "office" {
+		t.Fatalf("community %q", c.SNMPCommunity)
+	}
+}
