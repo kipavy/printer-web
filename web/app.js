@@ -9,10 +9,10 @@
     cfg: { name: "printer-web", location: "", publicURL: location.origin, lang: "auto", showNames: false },
     printer: null, // last /api/printer answer
     caps: {}, // last known good capabilities
-    doc: null, // {id, name, kind, pages, pdf, landscape, previewFailed}
+    doc: null, // {id, name, kind, pages, pdf, landscape, orientKnown, previewFailed, file}
     uploading: false,
     notice: "",
-    o: { color: true, sides: "one", orient: "auto", quality: "fast", copies: 1, pages: "all", spec: "", paper: "", tray: "" },
+    o: { color: true, sides: "one", orient: "auto", quality: "standard", copies: 1, pages: "all", spec: "", paper: "", tray: "" },
     est: null, // {key, sheets, cost, currency}
     jobs: { queue: [], history: [] },
     qOpen: false
@@ -20,8 +20,9 @@
   const pending = new Set();
   const thumbs = new Map(); // page number -> canvas | false (failed)
   let docToken = 0;
-  let keyFor = { id: null, key: "" }; // idempotency key per draft
+  let keyFor = { id: null, est: "", key: "" }; // idempotency key per draft and options
   let submitting = false;
+  let lastPrint = null; // {file, name, pages, options, job} of the last submitted job, for "Try again"
 
   // ---------- helpers ----------
   const API_TIMEOUT = 8000;
@@ -100,6 +101,8 @@
   }
   function criticalReason() { const rs = reasons(); return CRITICAL.find((c) => rs.includes(c)) || ""; }
   function blockingReason() { const rs = reasons(); return BLOCKING.find((c) => rs.includes(c)) || ""; }
+  // help text for a reason, with the paper in use (e.g. "Add A4 sheets")
+  function reasonHelp(r) { return t("reason." + r + ".help", { paper: S.o.paper || (S.caps.papers || [])[0] || "A4" }); }
 
   let printerBusy = false, printerAgain = false, printerSeq = 0;
   async function refreshPrinter() {
@@ -217,9 +220,14 @@
     return { list: [...out].sort((x, y) => x - y) };
   }
   const pagesParam = () => (S.o.pages === "all" ? "" : S.o.spec.trim());
+  // "auto" becomes the first page's orientation when the preview could read it
+  function orientJSON() {
+    if (S.o.orient !== "auto" || !S.doc || !S.doc.orientKnown) return S.o.orient;
+    return S.doc.landscape ? "landscape" : "portrait";
+  }
   function optsJSON() {
     const o = S.o, c = S.caps;
-    return { copies: o.copies, sides: c.duplex ? o.sides : "one", color: c.color ? o.color : false, paper: o.paper || "", orientation: o.orient, quality: c.quality ? o.quality : "", tray: o.tray || "" };
+    return { copies: o.copies, sides: c.duplex ? o.sides : "one", color: c.color ? o.color : false, paper: o.paper || "", orientation: orientJSON(), quality: c.quality ? o.quality : "", tray: o.tray || "" };
   }
   function effectiveLandscape() {
     if (S.o.orient === "landscape") return true;
@@ -263,7 +271,7 @@
     S.doc = null; S.est = null;
     thumbs.clear();
     pending.clear();
-    keyFor = { id: null, key: "" };
+    keyFor = { id: null, est: "", key: "" };
     S.o.pages = "all"; S.o.spec = ""; $("#pagesInput").value = "";
   }
 
@@ -382,7 +390,7 @@
     dropDoc();
     if (old && old.id !== info.id) api("DELETE", "/api/uploads/" + encodeURIComponent(old.id)).catch(() => {});
     const tok = docToken;
-    const d = { id: info.id, name: info.name, kind: info.kind, pages: info.pages || 1, pdf: null, landscape: false, previewFailed: false };
+    const d = { id: info.id, name: info.name, kind: info.kind, pages: info.pages || 1, pdf: null, landscape: false, orientKnown: false, previewFailed: false, file: info.file || null };
     S.doc = d;
     try {
       const pdf = await openPdf("/api/uploads/" + encodeURIComponent(info.id) + "/pdf");
@@ -391,6 +399,7 @@
       if (!info.pages) d.pages = pdf.numPages;
       const first = await pdf.getPage(1), vp = first.getViewport({ scale: 1 });
       d.landscape = vp.width > vp.height;
+      d.orientKnown = vp.width !== vp.height;
       first.cleanup();
     } catch (e) {
       if (tok !== docToken) return false;
@@ -411,7 +420,7 @@
     try {
       const r = await api("POST", "/api/uploads", fd);
       S.uploading = false;
-      await adoptDraft(r);
+      await adoptDraft(Object.assign({}, r, { file: f }));
     } catch (e) {
       S.notice = I18N.errMsg(e.key);
     }
@@ -443,7 +452,7 @@
     if (scrim.hidden) return;
     if (e.key === "Escape") { if (!submitting) closeSheet(); return; }
     if (e.key === "Tab") { // keep focus inside the sheet
-      const fs = [...dlg.querySelectorAll("button:not([disabled]),a[href],select,input")];
+      const fs = [...dlg.querySelectorAll("button:not([disabled]):not([hidden]),a[href],select,input")];
       if (!fs.length) { e.preventDefault(); return; }
       const first = fs[0], last = fs[fs.length - 1];
       if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
@@ -472,7 +481,7 @@
     const supHtml = sup.length ? '<div class="label">' + esc(t("supplies")) + '</div><div class="sup">' + sup.map((s) =>
       "<div><span>" + esc(s.name) + '</span><span class="t"><i style="width:' + level(s) + "%;background:" + supplyColor(s) + '"></i></span><span>' + (s.level >= 0 ? level(s) + " %" : "?") + "</span></div>").join("") + "</div>" : "";
     const where = [c.model, S.cfg.location].filter(Boolean).join(", ");
-    const help = crit ? '<div class="alert warn">' + esc(t("reason." + crit + ".help")) + "</div>" : (p.state === "unreachable" ? '<div class="alert">' + esc(t("err.printer_unreachable")) + "</div>" : "");
+    const help = crit ? '<div class="alert warn">' + esc(reasonHelp(crit)) + "</div>" : (p.state === "unreachable" ? '<div class="alert">' + esc(t("err.printer_unreachable")) + "</div>" : "");
     showSheet('<h2 id="dlgTitle">' + esc(title) + "</h2><p>" + esc(where || S.cfg.name) + "</p>" +
       '<dl class="recap">' + rows.join("") + '<dt>' + esc(t("ps_address")) + '</dt><dd class="addr">' + esc(S.cfg.publicURL) + "</dd></dl>" + supHtml + help +
       '<div class="actions" style="margin-top:14px"><button type="button" class="btn" id="ok">' + esc(t("close")) + "</button></div>");
@@ -480,7 +489,7 @@
   }
 
   function showBlocked(r) {
-    showSheet('<h2 id="dlgTitle">' + esc(t("reason." + r)) + "</h2><p>" + esc(t("reason_blocked")) + '</p><div class="alert">' + esc(t("reason." + r + ".help")) +
+    showSheet('<h2 id="dlgTitle">' + esc(t("reason." + r)) + "</h2><p>" + esc(t("reason_blocked")) + '</p><div class="alert">' + esc(reasonHelp(r)) +
       '</div><div class="actions" style="margin-top:16px"><button type="button" class="btn" id="ok">' + esc(t("understood")) + "</button></div>");
     sheetClose("ok");
   }
@@ -502,7 +511,8 @@
     const sh = est ? est.sheets : sheetsFor(sel.list.length, S.o.copies, S.o.sides);
     const cost = est && est.cost !== undefined ? fmtCost(est.cost, est.currency) : "";
     const total = tp("sheets", sh) + (cost ? " · " + cost : "");
-    if (keyFor.id !== d.id) keyFor = { id: d.id, key: newKey() };
+    // a new key when the draft, the pages or the options change
+    if (keyFor.id !== d.id || keyFor.est !== estKey()) keyFor = { id: d.id, est: estKey(), key: newKey() };
     const key = keyFor.key;
     const rows = [
       [t("r_file"), d.name],
@@ -529,9 +539,11 @@
       go.textContent = t("sending");
       $("#cerr").hidden = true;
       try {
-        const job = await api("POST", "/api/jobs", { upload: d.id, key: key, pages: pagesParam(), options: o });
+        const pages = pagesParam();
+        const job = await api("POST", "/api/jobs", { upload: d.id, key: key, pages: pages, options: o });
         if (!job || typeof job.id !== "string" || !job.id) throw { key: "internal" };
         submitting = false;
+        lastPrint = d.file ? { file: d.file, name: d.name, pages: pages, options: o, job: job.id } : null;
         // the draft now belongs to the job: back to the empty state
         dropDoc(); S.notice = ""; render();
         openProgress(job);
@@ -543,6 +555,7 @@
         ce.textContent = I18N.errMsg(e.key); ce.hidden = false;
         go.disabled = false; go.textContent = t("retry");
         $("#cancel").disabled = false;
+        go.focus();
       }
     };
   }
@@ -550,8 +563,10 @@
   // ---------- progress sheet ----------
   const STEP_OF = { queued: 0, preparing: 0, sending: 1, printing: 2 };
   function openProgress(job) {
-    showSheet('<div class="live" id="prog" aria-live="polite" aria-atomic="true"></div><div class="actions"><button type="button" class="btn" id="ok"></button></div>');
+    showSheet('<div class="live" id="prog" aria-live="polite" aria-atomic="true"></div><div class="actions"><button type="button" class="btn" id="ok"></button>' +
+      '<button type="button" class="print" id="again" hidden></button></div>');
     sheetClose("ok");
+    $("#again").onclick = retryPrint;
     progress = { id: job.id, sheets: job.sheets, timer: 0, misses: 0, done: false };
     paintProgress(job);
     pollJob(1500);
@@ -597,19 +612,57 @@
       okLabel = t("finish"); okCls = "print";
     } else if (j.state === "canceled") {
       title = t("canceled_title");
-      h = "<p>" + esc(t("canceled_sub")) + "</p>";
+      h = "<p>" + esc(j.error ? I18N.errMsg(j.error) : t("canceled_sub")) + "</p>";
     } else { // failed
       title = t("failed_title");
       const b = criticalReason();
       let msg = I18N.errMsg(j.error || "internal");
-      if (b && (j.error === "printer_error" || j.error === "printer_unreachable" || !j.error)) msg = t("reason." + b) + ". " + t("reason." + b + ".help");
+      if (b && (j.error === "printer_error" || j.error === "printer_unreachable" || !j.error)) msg = t("reason." + b) + ". " + reasonHelp(b);
       h = '<div class="alert bad">' + esc(msg) + "</div>";
+      if (canRetry(j)) h += "<p>" + esc(t("retry_hint")) + "</p>";
+    }
+    const again = $("#again");
+    if (again && !again.dataset.busy) {
+      again.hidden = !canRetry(j);
+      if (again.textContent !== t("retry_print")) again.textContent = t("retry_print");
     }
     // the title lives inside the live region so screen readers announce it; skip no-op writes
     const html = '<h2 id="dlgTitle">' + esc(title) + "</h2>" + h;
     if (prog.dataset.html !== html) { prog.innerHTML = html; prog.dataset.html = html; }
     if (ok.textContent !== okLabel) ok.textContent = okLabel;
     if (ok.className !== okCls) ok.className = okCls;
+  }
+
+  // a printer problem can be retried while we still have the file
+  function canRetry(j) {
+    return !!(j && j.state === "failed" && lastPrint && progress && lastPrint.job === progress.id &&
+      (j.error === "printer_unreachable" || j.error === "printer_error"));
+  }
+
+  // "Try again": upload the same file again and print it with the same
+  // options and a new key. The tap on the button is the confirmation.
+  async function retryPrint() {
+    const lp = lastPrint, again = $("#again");
+    if (!lp || !again || submitting) return;
+    submitting = true;
+    again.disabled = true; again.dataset.busy = "1"; again.textContent = t("retrying");
+    try {
+      const fd = new FormData();
+      fd.append("file", lp.file, lp.name);
+      const up = await api("POST", "/api/uploads", fd);
+      const job = await api("POST", "/api/jobs", { upload: up.id, key: newKey(), pages: lp.pages, options: lp.options });
+      if (!job || typeof job.id !== "string" || !job.id) throw { key: "internal" };
+      submitting = false;
+      lp.job = job.id;
+      openProgress(job);
+    } catch (e) {
+      submitting = false;
+      if (!document.contains(again)) return;
+      delete again.dataset.busy;
+      again.disabled = false; again.textContent = t("retry_print");
+      toast(I18N.errMsg(e.key));
+      again.focus();
+    }
   }
 
   // ---------- queue and history ----------
