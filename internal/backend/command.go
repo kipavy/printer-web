@@ -136,6 +136,7 @@ func (b *commandBackend) Submit(ctx context.Context, pdf, name string, o Options
 	if err := validate(o); err != nil {
 		return Handle{}, err
 	}
+	o = withDefaultPaper(o, b.cfg.Declared.Papers)
 	argv := buildArgv(b.cfg.Command, pdf, name, o)
 	if len(argv) == 0 || argv[0] == "" {
 		return Handle{}, errors.New("empty print command")
@@ -158,3 +159,12 @@ func (b *commandBackend) Submit(ctx context.Context, pdf, name string, o Options
 func (b *commandBackend) Track(context.Context, Handle) (JobState, error) { return JobSent, nil }
 
 func (b *commandBackend) Cancel(context.Context, Handle) error { return ErrNotSupported }
+
+// withDefaultPaper fills an empty paper with the first declared one, so a
+// {paper} token never expands to nothing for API clients that omit it.
+func withDefaultPaper(o Options, papers []string) Options {
+	if o.Paper == "" && len(papers) > 0 {
+		o.Paper = papers[0]
+	}
+	return o
+}

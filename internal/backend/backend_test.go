@@ -878,3 +878,15 @@ func TestCommandTimeout(t *testing.T) {
 		t.Errorf("took %v", time.Since(start))
 	}
 }
+
+func TestCommandDefaultPaper(t *testing.T) {
+	if got := withDefaultPaper(Options{}, []string{"A4", "A5"}); got.Paper != "A4" {
+		t.Errorf("paper = %q, want A4", got.Paper)
+	}
+	if got := withDefaultPaper(Options{Paper: "A5"}, []string{"A4"}); got.Paper != "A5" {
+		t.Errorf("paper = %q, want A5", got.Paper)
+	}
+	if got := withDefaultPaper(Options{}, nil); got.Paper != "" {
+		t.Errorf("paper = %q, want empty", got.Paper)
+	}
+}
