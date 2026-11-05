@@ -169,7 +169,7 @@ printer-web has no login. Anyone who can reach the port can print and see the qu
 - Changes need a custom header or a JSON content type, which blocks simple cross-site requests. The visitor cookie only separates people's jobs, it is not a login.
 - A Host-header guard blocks DNS-rebinding attacks: the server only answers when it is reached by IP address, `localhost`, a name ending in `.local`, `.lan`, `.home.arpa` or `.internal`, or the host of `PUBLIC_URL`. If you use another DNS name, or a single-label host such as `http://printbox:28431`, set `PUBLIC_URL` to that address, otherwise requests are refused.
 - Uploads are limited in size (`MAX_UPLOAD_MB`), type-checked by content, processed by Ghostscript in `-dSAFER` mode, and deleted when the job ends or after `DRAFT_TTL`. Files left by a crash are deleted at the next start.
-- Logs carry job ids and errors, never file names or contents.
+- Logs carry job ids and errors, never file contents. They do not include file names, unless your own `PRINTER_COMMAND` prints `{name}` in its error output.
 - The container runs as an unprivileged user.
 
 ## Example: Ricoh SP C240DN

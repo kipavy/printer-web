@@ -26,6 +26,41 @@ const shutdownGrace = 3 * time.Second
 
 func main() { os.Exit(run()) }
 
+// tempMarker marks a directory created by printer-web, so a restart only
+// ever empties a directory it made itself.
+const tempMarker = ".printer-web"
+
+// prepareTempDir returns base/printer-web-<uid>, emptied and recreated with
+// mode 0700. An existing directory is only removed when it is a real
+// directory (not a symlink) holding the marker; anything else is an error.
+func prepareTempDir(base string) (string, error) {
+	if !filepath.IsAbs(base) {
+		return "", fmt.Errorf("temporary directory %q is not absolute", base)
+	}
+	dir := filepath.Join(base, fmt.Sprintf("printer-web-%d", os.Getuid()))
+	if fi, err := os.Lstat(dir); err == nil {
+		if !fi.IsDir() {
+			return "", fmt.Errorf("%s exists and is not a directory", dir)
+		}
+		if _, err := os.Lstat(filepath.Join(dir, tempMarker)); err != nil {
+			return "", fmt.Errorf("%s exists but was not created by printer-web; remove it", dir)
+		}
+		if err := os.RemoveAll(dir); err != nil {
+			return "", fmt.Errorf("cannot clean %s: %w", dir, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	// Mkdir (not MkdirAll) fails if someone else created it in the meantime.
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		return "", fmt.Errorf("cannot create %s: %w", dir, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, tempMarker), nil, 0o600); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
 func run() int {
 	cfg, err := config.FromEnv()
 	if err != nil {
@@ -34,13 +69,9 @@ func run() int {
 	}
 	// A fixed directory, emptied at start: files left by a crash or a kill
 	// are deleted on the next start.
-	dir := filepath.Join(os.TempDir(), "printer-web")
-	if err := os.RemoveAll(dir); err != nil {
-		log.Printf("cannot clean temp dir %s: %v", dir, err)
-		return 1
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		log.Printf("cannot create temp dir %s: %v", dir, err)
+	dir, err := prepareTempDir(os.TempDir())
+	if err != nil {
+		log.Printf("temp dir: %v", err)
 		return 1
 	}
 	defer os.RemoveAll(dir)
