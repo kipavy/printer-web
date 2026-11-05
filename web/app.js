@@ -92,7 +92,7 @@
   }
 
   // ---------- printer status ----------
-  const CRITICAL = ["media-jam", "door-open", "media-empty", "media-needed", "toner-empty", "output-area-full", "input-tray-missing", "offline", "paused", "shutdown"];
+  const CRITICAL = ["media-jam", "door-open", "media-empty", "media-needed", "toner-empty", "output-area-full", "input-tray-missing", "marker-supply-missing", "offline", "paused", "shutdown"];
   const BLOCKING = ["media-empty", "media-jam", "door-open"];
   const baseReason = (r) => String(r).replace(/-(error|warning|report)$/, "");
   const known = (r) => t("reason." + r) !== "reason." + r;
@@ -146,7 +146,10 @@
     else if (crit) { state = "warn"; txt = t("reason." + crit); sub = trayTxt; }
     else if (p.state === "stopped") { state = "warn"; txt = t("st_stopped"); }
     else if (p.state === "printing") { state = "busy"; txt = t("st_printing"); }
-    else if (reasons().includes("toner-low")) { state = "warn"; sub = t("reason.toner-low"); }
+    else {
+      const low = ["toner-low", "media-low"].filter((r) => reasons().includes(r));
+      if (low.length) { state = "warn"; sub = low.map((r) => t("reason." + r)).join(" · "); }
+    }
     st.dataset.state = state;
     $("#statusTxt").textContent = txt;
     $("#statusSub").textContent = sub;
@@ -768,17 +771,35 @@
     try {
       new QRCode($("#qr"), { text: S.cfg.publicURL, width: 116, height: 116, colorDark: "#16191f", colorLight: "#ffffff" });
     } catch (e) { $("#qr").textContent = "QR"; }
+    // A draft handed over by the QR page: show the loading state at once,
+    // the preview can take a while on a slow link.
+    const qp = new URLSearchParams(location.search);
+    const handoff = qp.get("upload");
+    if (handoff) S.uploading = true;
     renderPrinter();
     render();
-    await refreshPrinter();
+    // The printer status (slow with SNMP) loads alongside the preview.
+    const printerReady = refreshPrinter().catch(() => {});
     refreshJobs();
 
-    const qp = new URLSearchParams(location.search);
-    if (qp.get("upload")) {
-      const id = qp.get("upload"), name = qp.get("name") || "affiche-qr.png";
+    if (handoff) {
+      const name = qp.get("name") || "affiche-qr.png";
       history.replaceState(null, "", location.pathname);
-      if (await adoptDraft({ id: id, name: name, kind: qp.get("kind") || "image", pages: 0 })) onPrint();
-      else render();
+      let ok = false;
+      try {
+        ok = await adoptDraft({ id: handoff, name: name, kind: qp.get("kind") || "image", pages: 0 });
+      } catch (e) {
+        ok = false;
+      } finally {
+        S.uploading = false;
+        render();
+      }
+      if (ok) {
+        await printerReady; // the print sheet checks for blocking reasons
+        onPrint();
+      }
+    } else {
+      await printerReady;
     }
 
     setInterval(() => { if (!document.hidden) refreshPrinter(); }, 10000);

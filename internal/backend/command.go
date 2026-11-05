@@ -26,7 +26,8 @@ var safeValue = regexp.MustCompile(`^[A-Za-z0-9._+x-]*$`)
 type commandBackend struct {
 	cfg     config.Config
 	timeout time.Duration
-	probe   *probe // optional PRINTER_PROBE check
+	probe   *probe      // optional PRINTER_PROBE check
+	snmp    *snmpReader // optional PRINTER_SNMP supplies and alerts
 	state   stateLog
 }
 
@@ -41,6 +42,9 @@ func newCommand(cfg config.Config) (*commandBackend, error) {
 	if cfg.PrinterProbe != "" {
 		b.probe = newProbe(cfg.PrinterProbe)
 	}
+	if cfg.SNMP != "" {
+		b.snmp = newSNMPReader(cfg.SNMP, cfg.SNMPCommunity)
+	}
 	return b, nil
 }
 
@@ -49,7 +53,7 @@ func (b *commandBackend) Caps(context.Context) (Caps, error) {
 }
 
 // Status checks that the program exists and, with PRINTER_PROBE, that the
-// printer accepts TCP connections.
+// printer accepts TCP connections. PRINTER_SNMP adds supplies and alerts.
 func (b *commandBackend) Status(ctx context.Context) (Status, error) {
 	if len(b.cfg.Command) == 0 {
 		return Status{State: StateUnreachable}, nil
@@ -59,10 +63,14 @@ func (b *commandBackend) Status(ctx context.Context) (Status, error) {
 		return Status{State: StateUnreachable}, nil
 	}
 	b.state.note(nil)
+	st := Status{State: StateReady}
 	if b.probe != nil {
-		return b.probe.status(ctx)
+		var err error
+		if st, err = b.probe.status(ctx); err != nil {
+			return st, err
+		}
 	}
-	return Status{State: StateReady}, nil
+	return b.snmp.merge(ctx, st), nil
 }
 
 // validate rejects option values that could be read as command-line flags.

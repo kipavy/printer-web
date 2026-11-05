@@ -65,6 +65,7 @@ type rawBackend struct {
 	cfg     config.Config
 	convert converter
 	tmp     string
+	snmp    *snmpReader // optional PRINTER_SNMP supplies and alerts
 }
 
 func newRaw(cfg config.Config) *rawBackend {
@@ -72,7 +73,11 @@ func newRaw(cfg config.Config) *rawBackend {
 	if u, err := url.Parse(cfg.PrinterURI); err == nil && u.Host != "" {
 		addr = u.Host
 	}
-	return &rawBackend{probe: newProbe(addr), cfg: cfg, convert: docs.Convert, tmp: os.TempDir()}
+	b := &rawBackend{probe: newProbe(addr), cfg: cfg, convert: docs.Convert, tmp: os.TempDir()}
+	if cfg.SNMP != "" {
+		b.snmp = newSNMPReader(cfg.SNMP, cfg.SNMPCommunity)
+	}
+	return b
 }
 
 // rawDuplexOK reports whether duplex can be requested in that language.
@@ -93,8 +98,14 @@ func declaredCaps(cfg config.Config) Caps {
 }
 
 // Status reports "printing" while a job is being sent, otherwise checks that
-// the socket accepts connections.
-func (b *rawBackend) Status(ctx context.Context) (Status, error) { return b.status(ctx) }
+// the socket accepts connections. PRINTER_SNMP adds supplies and alerts.
+func (b *rawBackend) Status(ctx context.Context) (Status, error) {
+	st, err := b.status(ctx)
+	if err != nil {
+		return st, err
+	}
+	return b.snmp.merge(ctx, st), nil
+}
 
 // duplex returns the PostScript header or the PCL-XL Ghostscript flags that
 // select one- or two-sided printing. Nothing when duplex is not declared.
