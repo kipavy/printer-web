@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ghostscript enscript libheif-examples libtiff-tools cups-ipp-utils
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race -timeout 30m ./...
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (smoke test, amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: printer-web:ci
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          docker run -d --name pw -p 28431:28431 \
+            -e PRINTER_BACKEND=command \
+            -e 'PRINTER_COMMAND=["cp","{file}","/tmp/printed.pdf"]' \
+            printer-web:ci
+          trap 'docker logs pw || true' EXIT
+          for i in $(seq 1 30); do
+            curl -fs http://localhost:28431/api/config >/dev/null && break
+            sleep 1
+          done
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:28431/api/config)" = 200
+
+          # Fixtures made by the image's own Ghostscript.
+          gsrun() { docker exec pw gs -q -dSAFER -dBATCH -dNOPAUSE "$@" -c "0 0 1 setrgbcolor 50 50 300 300 rectfill showpage"; }
+          gsrun -sDEVICE=pdfwrite -sOutputFile=/tmp/t.pdf
+          gsrun -sDEVICE=png16m -r50 -sOutputFile=/tmp/t.png
+          gsrun -sDEVICE=jpeg -r50 -sOutputFile=/tmp/t.jpg
+          docker exec pw sh -c 'echo "Hello from the smoke test" > /tmp/t.txt'
+          mkdir fixtures
+          for f in t.pdf t.png t.jpg t.txt; do docker cp "pw:/tmp/$f" fixtures/; done
+
+          jar=$(mktemp)
+          pdf_id=""
+          for f in t.pdf t.png t.jpg t.txt; do
+            out=$(curl -fsS -b "$jar" -c "$jar" -H 'X-Requested-With: printer-web' \
+              -F "file=@fixtures/$f" http://localhost:28431/api/uploads)
+            echo "$f -> $out"
+            pages=$(echo "$out" | sed -n 's/.*"pages":\([0-9]*\).*/\1/p')
+            test "${pages:-0}" -ge 1
+            if [ "$f" = t.pdf ]; then
+              pdf_id=$(echo "$out" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+            fi
+          done
+          test -n "$pdf_id"
+
+          job=$(curl -fsS -b "$jar" -c "$jar" -H 'X-Requested-With: printer-web' \
+            -H 'Content-Type: application/json' \
+            -d "{\"upload\":\"$pdf_id\",\"key\":\"ci-$GITHUB_RUN_ID\",\"options\":{\"copies\":1,\"sides\":\"one\",\"color\":true,\"paper\":\"A4\"}}" \
+            http://localhost:28431/api/jobs)
+          echo "job: $job"
+          job_id=$(echo "$job" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+          test -n "$job_id"
+
+          state=""
+          for i in $(seq 1 60); do
+            state=$(curl -fsS -b "$jar" http://localhost:28431/api/jobs/"$job_id" \
+              | sed -n 's/.*"state":"\([^"]*\)".*/\1/p')
+            echo "state: $state"
+            case "$state" in sent|done) break ;; failed) echo "job failed"; exit 1 ;; esac
+            sleep 1
+          done
+          case "$state" in sent|done) ;; *) echo "timeout, last state: $state"; exit 1 ;; esac
+
+          docker exec pw test -s /tmp/printed.pdf
+
+      - name: Image size
+        run: |
+          size=$(docker image inspect -f '{{.Size}}' printer-web:ci)
+          echo "Image size: $((size / 1024 / 1024)) MiB ($size bytes)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/kipavy/printer-web
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - name: Build and push (amd64, arm64)
+        if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
