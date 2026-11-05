@@ -3,6 +3,7 @@ package docs
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,13 +22,18 @@ func pageCountArgs(pdf string) []string {
 
 // PageCount returns the number of pages of a PDF.
 func PageCount(ctx context.Context, pdf string) (int, error) {
+	pdf, err := filepath.Abs(pdf)
+	if err != nil {
+		return 0, err
+	}
 	out, err := run(ctx, pageCountArgs(pdf))
 	if err != nil {
 		return 0, err
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	last := lastLine(out)
+	n, err := strconv.Atoi(last)
 	if err != nil || n < 1 {
-		return 0, fmt.Errorf("unreadable page count %q", strings.TrimSpace(string(out)))
+		return 0, fmt.Errorf("unreadable page count %q", last)
 	}
 	return n, nil
 }
@@ -44,6 +50,10 @@ func prepareArgs(pdf string, pages []int, out string) []string {
 func Prepare(ctx context.Context, pdf string, pages []int, tmp string) (string, error) {
 	if len(pages) == 0 {
 		return "", fmt.Errorf("no pages selected")
+	}
+	pdf, err := filepath.Abs(pdf)
+	if err != nil {
+		return "", err
 	}
 	out, err := tempPath(tmp, "prep-*.pdf")
 	if err != nil {
@@ -107,4 +117,15 @@ func ParsePages(spec string, count int) ([]int, error) {
 	}
 	sort.Ints(res)
 	return res, nil
+}
+
+// lastLine returns the last non-empty line of out, trimmed.
+func lastLine(out []byte) string {
+	lines := strings.Split(strings.ReplaceAll(string(out), "\r", ""), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		if s := strings.TrimSpace(lines[i]); s != "" {
+			return s
+		}
+	}
+	return ""
 }

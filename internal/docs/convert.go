@@ -3,6 +3,7 @@ package docs
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -12,9 +13,8 @@ import (
 // Ghostscript device names, isolated so CI can correct them in one place.
 const (
 	devPWG = "pwgraster"
-	// devURF is the Apple raster device; Debian 12 gs 10.0 should provide
-	// "urf". Verify in CI.
-	devURF   = "urf"
+	// devURF is the Apple raster (URF) device name in Ghostscript.
+	devURF   = "appleraster"
 	devPS    = "ps2write"
 	devPXL   = "pxlcolor"
 	devPXLBW = "pxlmono"
@@ -45,14 +45,10 @@ func convertArgs(pdf, format string, color bool, out string) ([]string, error) {
 	switch format {
 	case "image/pwg-raster":
 		a = append(a, "-sDEVICE="+devPWG, dpi)
-		if !color {
-			a = append(a, "-sColorModel=Gray")
-		}
+		a = append(a, cupsColor(color)...)
 	case "image/urf":
 		a = append(a, "-sDEVICE="+devURF, dpi)
-		if !color {
-			a = append(a, "-sColorModel=Gray")
-		}
+		a = append(a, cupsColor(color)...)
 	case "application/postscript":
 		a = append(a, "-sDEVICE="+devPS)
 		if !color {
@@ -73,6 +69,10 @@ func convertArgs(pdf, format string, color bool, out string) ([]string, error) {
 // Convert renders the PDF into the printer's format and returns a file path
 // (callers stat it for the exact size). application/pdf returns pdf itself.
 func Convert(ctx context.Context, pdf, format string, color bool, tmp string) (string, error) {
+	pdf, err := filepath.Abs(pdf)
+	if err != nil {
+		return "", err
+	}
 	if format == "application/pdf" {
 		return pdf, nil
 	}
@@ -125,12 +125,18 @@ func parseInkcov(out []byte) ([]Coverage, error) {
 
 // InkCoverage measures per-page ink coverage with Ghostscript's inkcov device.
 func InkCoverage(ctx context.Context, pdf string) ([]Coverage, error) {
+	pdf, err := filepath.Abs(pdf)
+	if err != nil {
+		return nil, err
+	}
 	out, err := run(ctx, inkcovArgs(pdf))
 	if err != nil {
 		return nil, err
 	}
 	return parseInkcov(out)
 }
+
+var channels = [4]string{"C", "M", "Y", "K"}
 
 // EstimateCost returns sheets*Sheet + copies * Σ pages Σ colours
 // (coverage/5%) * price/yield. In mono mode only K counts, with the colour
@@ -141,11 +147,12 @@ func EstimateCost(cov []Coverage, sheets, copies int, mono bool, p config.Pricin
 	}
 	var perCopy float64
 	for _, c := range cov {
-		ch := map[string]float64{"C": c.C, "M": c.M, "Y": c.Y, "K": c.K}
+		ch := [4]float64{c.C, c.M, c.Y, c.K}
 		if mono {
-			ch = map[string]float64{"K": c.K + (c.C+c.M+c.Y)/3}
+			ch = [4]float64{0, 0, 0, c.K + (c.C+c.M+c.Y)/3}
 		}
-		for k, v := range ch {
+		for i, v := range ch {
+			k := channels[i]
 			cart, ok := p.Toner[k]
 			if !ok || cart.Yield <= 0 {
 				continue
@@ -154,4 +161,13 @@ func EstimateCost(cov []Coverage, sheets, copies int, mono bool, p config.Pricin
 		}
 	}
 	return float64(sheets)*p.Sheet + float64(copies)*perCopy, true
+}
+
+// cupsColor selects the raster colour space: 18 = sGray, 19 = sRGB, 8 bits.
+func cupsColor(color bool) []string {
+	cs := "18"
+	if color {
+		cs = "19"
+	}
+	return []string{"-dcupsColorSpace=" + cs, "-dcupsBitsPerColor=8"}
 }

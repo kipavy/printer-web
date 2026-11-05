@@ -3,7 +3,11 @@ package docs
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
+	"image"
+	"image/color"
+	"image/png"
 	"math"
 	"os"
 	"os/exec"
@@ -11,6 +15,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/kipavy/printer-web/internal/config"
 )
@@ -44,6 +49,9 @@ func TestDetect(t *testing.T) {
 		{"a.heic", heic, KindHEIC, nil},
 		{"a.txt", []byte("héllo wörld\n€\n"), KindText, nil},
 		{"bm.txt", []byte("BM is a text file"), KindText, nil},
+		{"bom.pdf", []byte("\xef\xbb\xbf  \n%PDF-1.7"), KindPDF, nil},
+		{"zipwithpdf.pdf", []byte("PK\x03\x04\x14\x00\x00\x00\x08\x00...%PDF-1.4..."), 0, ErrUnsupported},
+		{"hevc.heic", append([]byte{0, 0, 0, 0x18}, []byte("ftyphevm")...), KindHEIC, nil},
 		{"zip.pdf", []byte("PK\x03\x04\x14\x00\x00\x00\x08\x00"), 0, ErrUnsupported},
 		{"bin.txt", []byte{0x7f, 'E', 'L', 'F', 2, 1, 1}, 0, ErrUnsupported},
 		{"latin1.txt", []byte{'a', 0xE9, 'b'}, 0, ErrUnsupported},
@@ -170,7 +178,7 @@ func TestNormalizeArgs(t *testing.T) {
 		t.Fatalf("img nopaper: %v", got)
 	}
 	got, _ = normalizeArgs(KindPS, "in.ps", "out.pdf", 612, 792)
-	want = append(gsBase(), "-sDEVICE=pdfwrite", "-dDEVICEWIDTHPOINTS=612", "-dDEVICEHEIGHTPOINTS=792", "-dFIXEDMEDIA", "-dPDFFitPage", "-sOutputFile=out.pdf", "in.ps")
+	want = append(gsBase(), "-sDEVICE=pdfwrite", "-sOutputFile=out.pdf", "in.ps")
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ps: %v", got)
 	}
@@ -180,7 +188,7 @@ func TestNormalizeArgs(t *testing.T) {
 	if !reflect.DeepEqual(heicArgs("a.heic", "a.jpg"), []string{"heif-convert", "a.heic", "a.jpg"}) {
 		t.Error("heic argv")
 	}
-	if !reflect.DeepEqual(enscriptArgs("a.txt", "a.ps"), []string{"enscript", "-B", "-q", "--encoding=latin1", "--media=A4", "-o", "a.ps", "a.txt"}) {
+	if !reflect.DeepEqual(enscriptArgs("a.txt", "a.ps", 595, 842), []string{"enscript", "-B", "-q", "--encoding=latin1", "--media=A4", "-o", "a.ps", "a.txt"}) {
 		t.Error("enscript argv")
 	}
 	if !reflect.DeepEqual(psToPDFArgs("a.ps", "a.pdf"), append(gsBase(), "-sDEVICE=pdfwrite", "-sOutputFile=a.pdf", "a.ps")) {
@@ -251,7 +259,7 @@ func TestConvertArgs(t *testing.T) {
 	}
 	for f, want := range map[string]string{
 		"image/pwg-raster":       "pwgraster",
-		"image/urf":              "urf",
+		"image/urf":              "appleraster",
 		"application/postscript": "ps2write",
 	} {
 		if got := dev(f, true); got != want {
@@ -264,6 +272,13 @@ func TestConvertArgs(t *testing.T) {
 	a, _ := convertArgs("in.pdf", "image/pwg-raster", true, "out")
 	if !contains(a, "-r300") {
 		t.Errorf("pwg must be 300 dpi: %v", a)
+	}
+	for _, f := range []string{"image/pwg-raster", "image/urf"} {
+		m, _ := convertArgs("in.pdf", f, false, "out")
+		c, _ := convertArgs("in.pdf", f, true, "out")
+		if !contains(m, "-dcupsColorSpace=18") || !contains(c, "-dcupsColorSpace=19") || !contains(m, "-dcupsBitsPerColor=8") || !contains(c, "-r300") || !contains(m, "-r300") {
+			t.Errorf("%s cups params: %v | %v", f, m, c)
+		}
 	}
 	if _, err := convertArgs("in.pdf", "text/html", true, "out"); err == nil {
 		t.Error("unknown format must fail")
@@ -294,8 +309,9 @@ func TestPrepareArgs(t *testing.T) {
 }
 
 func TestConvertPDFNoop(t *testing.T) {
+	abs, _ := filepath.Abs("x.pdf")
 	got, err := Convert(context.Background(), "x.pdf", "application/pdf", true, t.TempDir())
-	if err != nil || got != "x.pdf" {
+	if err != nil || got != abs {
 		t.Fatalf("got %q %v", got, err)
 	}
 	if _, err := Convert(context.Background(), "x.pdf", "bogus/type", true, t.TempDir()); err == nil {
@@ -312,7 +328,7 @@ func TestRunErrorCapturesStderr(t *testing.T) {
 	if !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("stderr missing: %v", err)
 	}
-	if len(err.Error()) > maxStderr+200 {
+	if len(err.Error()) > 2*maxTail+len(os.Args[0])+200 {
 		t.Fatalf("error not truncated: %d", len(err.Error()))
 	}
 }
@@ -321,7 +337,11 @@ func TestHelperFail(t *testing.T) {
 	if os.Getenv("DOCS_HELPER") != "1" {
 		return
 	}
-	os.Stderr.WriteString("boom " + strings.Repeat("x", 5000))
+	if os.Getenv("DOCS_HELPER_MODE") == "stdout" {
+		os.Stdout.WriteString("Error: /undefined in foo\n")
+		os.Exit(1)
+	}
+	os.Stderr.WriteString(strings.Repeat("x", 5000) + " boom")
 	os.Exit(3)
 }
 
@@ -343,15 +363,43 @@ func TestNormalizeWithFakeRunner(t *testing.T) {
 		t.Fatalf("calls: %v", calls)
 	}
 	calls = nil
-	heic := write(t, "a.heic", []byte("x"))
-	if _, err := Normalize(context.Background(), heic, KindHEIC, 595, 842, tmp); err != nil {
-		t.Fatal(err)
+	// heif-convert fake: creates out.jpg, or out-1.jpg+out-2.jpg when told so.
+	for _, names := range [][]string{{"out.jpg"}, {"out-2.jpg", "out-1.jpg"}} {
+		calls = nil
+		run = func(ctx context.Context, argv []string) ([]byte, error) {
+			calls = append(calls, argv)
+			if argv[0] == "heif-convert" {
+				dir := filepath.Dir(argv[2])
+				if filepath.Base(argv[2]) != "out.jpg" || filepath.Dir(dir) != tmp {
+					t.Errorf("bad heif target %s", argv[2])
+				}
+				for _, n := range names {
+					os.WriteFile(filepath.Join(dir, n), []byte("j"), 0o600)
+				}
+			}
+			return nil, nil
+		}
+		heic := write(t, "a.heic", []byte("x"))
+		if _, err := Normalize(context.Background(), heic, KindHEIC, 595, 842, tmp); err != nil {
+			t.Fatal(err)
+		}
+		if len(calls) != 2 || calls[0][0] != "heif-convert" || calls[1][0] != "img2pdf" {
+			t.Fatalf("heic calls: %v", calls)
+		}
+		if filepath.Base(calls[1][len(calls[1])-1]) != names[len(names)-1] {
+			t.Errorf("img2pdf input: %v", calls[1])
+		}
+		if m, _ := filepath.Glob(filepath.Join(tmp, "heic-*")); len(m) != 0 {
+			t.Errorf("heic dir not removed: %v", m)
+		}
 	}
-	if len(calls) != 2 || calls[0][0] != "heif-convert" || calls[1][0] != "img2pdf" {
-		t.Fatalf("heic calls: %v", calls)
+	// heif-convert producing nothing is an error.
+	run = func(ctx context.Context, argv []string) ([]byte, error) { return nil, nil }
+	if _, err := Normalize(context.Background(), write(t, "b.heic", []byte("x")), KindHEIC, 0, 0, tmp); err == nil {
+		t.Error("missing heif output must fail")
 	}
 	// PDFs pass through untouched.
-	if p, _ := Normalize(context.Background(), "x.pdf", KindPDF, 0, 0, tmp); p != "x.pdf" {
+	if p, _ := Normalize(context.Background(), "x.pdf", KindPDF, 0, 0, tmp); p != mustAbs("x.pdf") {
 		t.Error("pdf passthrough")
 	}
 	// Failure removes the temp output.
@@ -416,6 +464,132 @@ func TestPipelineIntegration(t *testing.T) {
 			if !bytes.Contains(b[:min(len(b), 512)], []byte(c.magic)) {
 				t.Errorf("%s color=%v: magic %q not found in %q", c.format, color, c.magic, b[:min(len(b), 40)])
 			}
+			if c.format == "image/pwg-raster" && len(b) >= 408 {
+				// PWG 5102.4: 4-byte sync, then the 1796-byte header; cupsColorSpace
+				// is at header offset 400 (after cupsColorOrder at 396).
+				cs := binary.BigEndian.Uint32(b[4+400:])
+				want := uint32(18)
+				if color {
+					want = 19
+				}
+				if cs != want {
+					t.Errorf("pwg color=%v: cupsColorSpace = %d, want %d", color, cs, want)
+				}
+			}
 		}
+	}
+}
+
+func mustAbs(p string) string { a, _ := filepath.Abs(p); return a }
+
+func TestRunErrorIncludesStdout(t *testing.T) {
+	t.Setenv("DOCS_HELPER", "1")
+	t.Setenv("DOCS_HELPER_MODE", "stdout")
+	_, err := run(context.Background(), []string{os.Args[0], "-test.run=TestHelperFail"})
+	if err == nil || !strings.Contains(err.Error(), "Error: /undefined in foo") {
+		t.Fatalf("stdout missing from error: %v", err)
+	}
+}
+
+func TestTailRuneBoundary(t *testing.T) {
+	s := tail([]byte(strings.Repeat("é", 400)), 511) // cuts mid-rune
+	if !utf8.ValidString(s) {
+		t.Fatal("tail must be valid UTF-8")
+	}
+}
+
+func TestPageCountLastLine(t *testing.T) {
+	old := run
+	defer func() { run = old }()
+	run = func(ctx context.Context, argv []string) ([]byte, error) {
+		return []byte("Warning: something\r\n 7 \r\n\r\n"), nil
+	}
+	if n, err := PageCount(context.Background(), "a.pdf"); err != nil || n != 7 {
+		t.Fatalf("got %d %v", n, err)
+	}
+	run = func(ctx context.Context, argv []string) ([]byte, error) { return []byte("junk\n"), nil }
+	if _, err := PageCount(context.Background(), "a.pdf"); err == nil {
+		t.Error("junk must fail")
+	}
+}
+
+func TestToLatin1BOM(t *testing.T) {
+	if got := toLatin1([]byte("\xef\xbb\xbfab")); string(got) != "ab" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestEnscriptMedia(t *testing.T) {
+	for _, c := range []struct {
+		w, h float64
+		want string
+	}{{595.28, 841.89, "A4"}, {612, 792, "Letter"}, {0, 0, "A4"}, {300, 400, "A4"}} {
+		if got := enscriptMedia(c.w, c.h); got != c.want {
+			t.Errorf("%v x %v: %s want %s", c.w, c.h, got, c.want)
+		}
+	}
+}
+
+func writePNG(t *testing.T, name string, img image.Image) string {
+	t.Helper()
+	var b bytes.Buffer
+	if err := png.Encode(&b, img); err != nil {
+		t.Fatal(err)
+	}
+	return write(t, name, b.Bytes())
+}
+
+func TestFlattenPNG(t *testing.T) {
+	tmp := t.TempDir()
+	rgba := image.NewNRGBA(image.Rect(0, 0, 2, 1))
+	rgba.SetNRGBA(0, 0, color.NRGBA{255, 0, 0, 255})
+	rgba.SetNRGBA(1, 0, color.NRGBA{0, 0, 0, 0}) // transparent
+	in := writePNG(t, "a.png", rgba)
+	out, err := flattenPNG(in, tmp)
+	if err != nil || out == "" {
+		t.Fatalf("got %q %v", out, err)
+	}
+	f, _ := os.Open(out)
+	defer f.Close()
+	img, err := png.Decode(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isOpaque(img) {
+		t.Error("output must be opaque")
+	}
+	if r, g, b, a := img.At(1, 0).RGBA(); r != 0xffff || g != 0xffff || b != 0xffff || a != 0xffff {
+		t.Errorf("transparent pixel = %x %x %x %x, want white", r, g, b, a)
+	}
+	if r, g, b, _ := img.At(0, 0).RGBA(); r != 0xffff || g != 0 || b != 0 {
+		t.Error("opaque pixel changed")
+	}
+	// Fully opaque RGBA and non-PNG files are left alone.
+	op := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	op.Set(0, 0, color.RGBA{1, 2, 3, 255})
+	if out, err := flattenPNG(writePNG(t, "o.png", op), tmp); err != nil || out != "" {
+		t.Errorf("opaque png: %q %v", out, err)
+	}
+	if out, err := flattenPNG(write(t, "j.jpg", []byte{0xFF, 0xD8, 0xFF, 0, 0, 0, 0, 0, 0}), tmp); err != nil || out != "" {
+		t.Errorf("jpeg: %q %v", out, err)
+	}
+}
+
+func TestNormalizeFlattensPNG(t *testing.T) {
+	old := run
+	defer func() { run = old }()
+	var argvs [][]string
+	run = func(ctx context.Context, argv []string) ([]byte, error) { argvs = append(argvs, argv); return nil, nil }
+	tmp := t.TempDir()
+	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	in := writePNG(t, "t.png", img) // fully transparent
+	if _, err := Normalize(context.Background(), in, KindImage, 595, 842, tmp); err != nil {
+		t.Fatal(err)
+	}
+	if len(argvs) != 1 || argvs[0][len(argvs[0])-1] == in {
+		t.Fatalf("img2pdf must read the flattened copy: %v", argvs)
+	}
+	if m, _ := filepath.Glob(filepath.Join(tmp, "flat-*")); len(m) != 0 {
+		t.Errorf("flattened copy not removed: %v", m)
 	}
 }

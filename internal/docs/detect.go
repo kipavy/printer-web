@@ -30,7 +30,7 @@ var (
 
 const sniffLen = 64 * 1024
 
-var heicBrands = []string{"heic", "heix", "hevc", "hevx", "heim", "heis", "mif1", "msf1"}
+var heicBrands = []string{"heic", "heix", "hevc", "hevx", "hevm", "hevs", "heim", "heis", "mif1", "msf1"}
 
 // Detect identifies a file by its magic bytes (never by its name).
 func Detect(path string) (Kind, error) {
@@ -51,12 +51,8 @@ func detectBytes(b []byte, truncated bool) (Kind, error) {
 	if len(b) == 0 {
 		return 0, ErrEmpty
 	}
-	head := b
-	if len(head) > 1024 {
-		head = head[:1024]
-	}
 	switch {
-	case bytes.Contains(head, []byte("%PDF-")):
+	case isPDF(b):
 		return KindPDF, nil
 	case bytes.HasPrefix(b, []byte("%!PS")), bytes.HasPrefix(b, []byte("\x04%!PS")):
 		return KindPS, nil
@@ -101,4 +97,12 @@ func looksText(b []byte, truncated bool) bool {
 		}
 	}
 	return true
+}
+
+// isPDF reports whether the header sits at the start, after an optional BOM
+// and whitespace (so a ZIP holding a PDF entry is not a PDF).
+func isPDF(b []byte) bool {
+	b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
+	b = bytes.TrimLeft(b, " \t\r\n\f")
+	return bytes.HasPrefix(b, []byte("%PDF-"))
 }
