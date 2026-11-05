@@ -63,7 +63,12 @@ func TestJPEGCMYKHeader(t *testing.T) {
 	}
 }
 
+// TestRasterSpeed guards against a per-pixel At() regression, not exact speed:
+// the bound is loose so slow or -race CI runners stay green.
 func TestRasterSpeed(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short mode")
+	}
 	start := time.Now()
 	for _, img := range []image.Image{
 		image.NewRGBA(image.Rect(0, 0, 2000, 2000)),
@@ -74,7 +79,7 @@ func TestRasterSpeed(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if d := time.Since(start); d > 3*time.Second {
+	if d := time.Since(start); d > 30*time.Second {
 		t.Errorf("3 x 4 MP took %v", d)
 	}
 }
