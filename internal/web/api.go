@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -17,7 +18,9 @@ import (
 	"github.com/kipavy/printer-web/internal/queue"
 )
 
-const apiStatusTimeout = 10 * time.Second
+// apiStatusTimeout stays below the front end's 8 s request timeout; the
+// backends' own queries are bounded at 5 s.
+const apiStatusTimeout = 6 * time.Second
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 	pub := s.cfg.PublicURL
@@ -68,15 +71,8 @@ func (s *Server) handlePrinter(w http.ResponseWriter, r *http.Request) {
 // paperSize returns the first supported paper's size in points (A4 default).
 func paperSize(papers []string) (float64, float64) {
 	if len(papers) > 0 {
-		switch strings.ToUpper(strings.TrimSpace(papers[0])) {
-		case "LETTER":
-			return 612, 792
-		case "LEGAL":
-			return 612, 1008
-		case "A5":
-			return 419.53, 595.28
-		case "A3":
-			return 841.89, 1190.55
+		if w, h, ok := backend.PaperSize(papers[0]); ok {
+			return w, h
 		}
 	}
 	return 595.28, 841.89
@@ -93,7 +89,10 @@ func cleanName(n string) string {
 	if r := []rune(n); len(r) > 120 {
 		n = string(r[:120])
 	}
-	if n == "" || n == "." || n == ".." || n == "/" {
+	if strings.TrimSpace(n) == "" {
+		return "document"
+	}
+	if n == "." || n == ".." || n == "/" {
 		return "document"
 	}
 	return n
@@ -168,6 +167,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnsupportedMediaType, "unsupported")
 		return
 	case err != nil:
+		log.Printf("upload: detect failed: %v", err)
 		writeError(w, http.StatusInternalServerError, "internal")
 		return
 	}
@@ -179,6 +179,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	case <-wait.C:
+		log.Print("upload: busy, two conversions already running")
 		writeError(w, http.StatusServiceUnavailable, "busy")
 		return
 	case <-r.Context().Done():
@@ -196,6 +197,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	pdf, err := s.normalize(ctx, file, kind, pw, ph, s.dir)
 	cancel()
 	if err != nil {
+		log.Printf("upload: conversion_failed (%s to PDF): %v", kindName(kind), err)
 		writeError(w, http.StatusUnprocessableEntity, "conversion_failed")
 		return
 	}
@@ -207,6 +209,7 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	pages, err := s.pageCount(ctx, pdf)
 	cancel()
 	if err != nil {
+		log.Printf("upload: conversion_failed (page count): %v", err)
 		writeError(w, http.StatusUnprocessableEntity, "conversion_failed")
 		return
 	}
@@ -218,10 +221,12 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 	cov, err := s.inkCov(ctx, pdf)
 	cancel()
 	if err != nil {
+		log.Printf("upload: ink coverage unavailable, no cost estimate: %v", err)
 		cov = nil // the cost estimate is optional
 	}
 	dr := s.drafts.Add(queue.Draft{
 		Visitor: visitorOf(r), Name: name, Kind: kind, PDF: pdf, Pages: pages, Coverage: cov,
+		Orientation: s.orientation(pdf),
 	})
 	keep = true
 	writeJSON(w, http.StatusOK, map[string]any{

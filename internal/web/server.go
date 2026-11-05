@@ -9,11 +9,13 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"log"
 	"mime"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kipavy/printer-web/internal/backend"
@@ -42,10 +44,14 @@ type Server struct {
 	busyFor time.Duration // how long an upload waits for a free slot
 
 	// Injectable document tools.
-	detect    func(path string) (docs.Kind, error)
-	normalize func(ctx context.Context, in string, k docs.Kind, w, h float64, tmp string) (string, error)
-	pageCount func(ctx context.Context, pdf string) (int, error)
-	inkCov    func(ctx context.Context, pdf string) ([]docs.Coverage, error)
+	detect      func(path string) (docs.Kind, error)
+	normalize   func(ctx context.Context, in string, k docs.Kind, w, h float64, tmp string) (string, error)
+	pageCount   func(ctx context.Context, pdf string) (int, error)
+	inkCov      func(ctx context.Context, pdf string) ([]docs.Coverage, error)
+	orientation func(pdf string) string
+
+	mu       sync.Mutex
+	rejected map[string]bool // hosts already logged by the 421 guard
 }
 
 // New builds a Server. dir is the drafts directory, assets the front end.
@@ -58,6 +64,8 @@ func New(cfg config.Config, b backend.Backend, d *queue.Drafts, q *queue.Queue, 
 		sem: make(chan struct{}, 2), busyFor: 30 * time.Second,
 		detect: docs.Detect, normalize: docs.Normalize,
 		pageCount: docs.PageCount, inkCov: docs.InkCoverage,
+		orientation: docs.FirstPageOrientation,
+		rejected:    map[string]bool{},
 	}
 }
 
@@ -100,15 +108,15 @@ func newVisitor() string {
 // middleware sets the visitor cookie and enforces the CSRF rules.
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.hostAllowed(r.Host) {
-			writeError(w, http.StatusMisdirectedRequest, "misdirected")
-			return
-		}
 		h := w.Header()
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Content-Security-Policy", csp)
+		if !s.hostAllowed(r.Host) {
+			s.misdirected(w, r)
+			return
+		}
 		visitor := ""
 		if c, err := r.Cookie(cookieName); err == nil && validVisitor(c.Value) {
 			visitor = c.Value
@@ -141,6 +149,35 @@ func (s *Server) middleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, visitor)))
 	})
+}
+
+// misdirected answers 421 for a Host the guard refuses: JSON for the API,
+// a short explanation for a browser.
+func (s *Server) misdirected(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if len(host) > 200 {
+		host = host[:200]
+	}
+	s.mu.Lock()
+	first := !s.rejected[host] && len(s.rejected) < 100
+	if first {
+		s.rejected[host] = true
+	}
+	s.mu.Unlock()
+	if first {
+		log.Printf("refused request for host %q (421): set PUBLIC_URL to that address to allow it", host)
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		writeError(w, http.StatusMisdirectedRequest, "misdirected")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusMisdirectedRequest)
+	_, _ = io.WriteString(w, "printer-web does not answer to the host name \""+host+"\".\n\n"+
+		"Open it by IP address (for example http://192.168.1.10:28431), or, if this name is the one\n"+
+		"you want people to use, set PUBLIC_URL to it (for example PUBLIC_URL=http://"+host+")\n"+
+		"and restart the server. This protects the printer against DNS rebinding attacks.\n")
 }
 
 func visitorOf(r *http.Request) string {
@@ -211,7 +248,7 @@ func (s *Server) hostAllowed(hostport string) bool {
 	if h, _, err := net.SplitHostPort(hostport); err == nil {
 		host = h
 	}
-	host = strings.ToLower(strings.Trim(host, "[]"))
+	host = strings.TrimSuffix(strings.ToLower(strings.Trim(host, "[]")), ".")
 	if host == "" {
 		return false
 	}
@@ -224,7 +261,7 @@ func (s *Server) hostAllowed(hostport string) bool {
 		}
 	}
 	if u, err := url.Parse(s.cfg.PublicURL); err == nil && u.Hostname() != "" {
-		return host == strings.ToLower(u.Hostname())
+		return host == strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
 	}
 	return false
 }
