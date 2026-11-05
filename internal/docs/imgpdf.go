@@ -17,8 +17,8 @@ import (
 	"strings"
 )
 
-// maxImagePixels bounds decoding memory (100 megapixels).
-const maxImagePixels = 100_000_000
+// maxImagePixels bounds decoding memory (50 megapixels).
+const maxImagePixels = 50_000_000
 
 // pdfImage is one image XObject ready to be embedded.
 type pdfImage struct {
@@ -26,6 +26,7 @@ type pdfImage struct {
 	cs     string // DeviceGray | DeviceRGB | DeviceCMYK
 	filter string // DCTDecode | FlateDecode
 	decode string // optional /Decode array, e.g. "[1 0 1 0 1 0 1 0]"
+	parms  string // optional /DecodeParms dictionary
 	data   []byte // stream bytes (already filtered)
 	orient int    // EXIF orientation 1..8
 }
@@ -37,6 +38,9 @@ type pdfImage struct {
 // the image at 72 dpi. JPEG data is embedded untouched; PNG, GIF and BMP are
 // decoded, composited on white and stored as Flate RGB or Gray.
 func imageToPDF(in, out string, paperW, paperH float64) error {
+	if !(paperW >= 0) || !(paperH >= 0) || math.IsInf(paperW, 0) || math.IsInf(paperH, 0) {
+		return fmt.Errorf("invalid paper size %vx%v", paperW, paperH)
+	}
 	raw, err := os.ReadFile(in)
 	if err != nil {
 		return err
@@ -116,6 +120,9 @@ func jpegImage(raw []byte) (*pdfImage, error) {
 		im.cs = "DeviceGray"
 	case color.YCbCrModel:
 		im.cs = "DeviceRGB"
+	case color.RGBAModel: // Adobe transform 0 or R,G,B component ids: no YCbCr step
+		im.cs = "DeviceRGB"
+		im.parms = " /DecodeParms << /ColorTransform 0 >>"
 	case color.CMYKModel:
 		im.cs = "DeviceCMYK"
 	default:
@@ -133,6 +140,7 @@ func jpegImage(raw []byte) (*pdfImage, error) {
 // Adobe APP14 marker and the EXIF orientation (1 when absent or invalid).
 func scanJPEGMarkers(b []byte) (adobe bool, orient int) {
 	orient = 1
+	seenExif := false
 	i := 2
 	for i+4 <= len(b) {
 		if b[i] != 0xFF {
@@ -156,7 +164,8 @@ func scanJPEGMarkers(b []byte) (adobe bool, orient int) {
 		}
 		seg := b[i+4 : i+2+n]
 		switch {
-		case m == 0xE1 && bytes.HasPrefix(seg, []byte("Exif\x00\x00")):
+		case m == 0xE1 && !seenExif && bytes.HasPrefix(seg, []byte("Exif\x00\x00")):
+			seenExif = true // only the first Exif segment counts
 			if o := exifOrientation(seg[6:]); o != 0 {
 				orient = o
 			}
@@ -209,47 +218,50 @@ func exifOrientation(t []byte) int {
 }
 
 // rasterImage compresses decoded pixels (alpha composited on white) as 8-bit
-// Flate Gray when every pixel is grey, RGB otherwise.
+// Flate Gray when every pixel is grey, RGB otherwise. Rows are converted once
+// into a packed RGB buffer while grey-ness is tracked.
 func rasterImage(img image.Image) (*pdfImage, error) {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 	if err := checkSize(w, h); err != nil {
 		return nil, err
 	}
-	pal := whitePalette(img)
-	row := make([]byte, 3*w)
-	grey := pal.allGrey
-	if !pal.known {
-		grey = true
-	scan:
-		for y := b.Min.Y; y < b.Max.Y; y++ {
-			rgbRow(img, y, row, pal)
+	pal := palInfo{}
+	if p, ok := img.(*image.Paletted); ok {
+		if len(p.Palette) == 0 {
+			return nil, fmt.Errorf("image has an empty palette")
+		}
+		pal = whitePalette(p)
+	}
+	pix := make([]byte, 3*w*h)
+	grey := true
+	for y := 0; y < h; y++ {
+		row := pix[3*w*y : 3*w*(y+1)]
+		rgbRow(img, b.Min.Y+y, row, pal)
+		if grey {
 			for x := 0; x < w; x++ {
 				if row[3*x] != row[3*x+1] || row[3*x] != row[3*x+2] {
 					grey = false
-					break scan
+					break
 				}
 			}
 		}
 	}
 	var buf bytes.Buffer
 	zw := zlib.NewWriter(&buf)
-	var gr []byte
 	if grey {
-		gr = make([]byte, w)
-	}
-	for y := b.Min.Y; y < b.Max.Y; y++ {
-		rgbRow(img, y, row, pal)
-		out := row
-		if grey {
+		gr := make([]byte, w)
+		for y := 0; y < h; y++ {
+			row := pix[3*w*y:]
 			for x := range gr {
 				gr[x] = row[3*x]
 			}
-			out = gr
+			if _, err := zw.Write(gr); err != nil {
+				return nil, err
+			}
 		}
-		if _, err := zw.Write(out); err != nil {
-			return nil, err
-		}
+	} else if _, err := zw.Write(pix); err != nil {
+		return nil, err
 	}
 	if err := zw.Close(); err != nil {
 		return nil, err
@@ -262,24 +274,13 @@ func rasterImage(img image.Image) (*pdfImage, error) {
 }
 
 // palInfo caches white-composited palette entries of a paletted image.
-type palInfo struct {
-	known   bool // paletted: allGrey is exact
-	allGrey bool
-	rgb     [][3]byte
-}
+type palInfo struct{ rgb [][3]byte }
 
-func whitePalette(img image.Image) palInfo {
-	p, ok := img.(*image.Paletted)
-	if !ok {
-		return palInfo{}
-	}
-	pi := palInfo{known: true, allGrey: true, rgb: make([][3]byte, len(p.Palette))}
+func whitePalette(p *image.Paletted) palInfo {
+	pi := palInfo{rgb: make([][3]byte, len(p.Palette))}
 	for i, c := range p.Palette {
 		r, g, b, a := c.RGBA()
 		pi.rgb[i] = [3]byte{over(r, a), over(g, a), over(b, a)}
-		if pi.rgb[i][0] != pi.rgb[i][1] || pi.rgb[i][0] != pi.rgb[i][2] {
-			pi.allGrey = false
-		}
 	}
 	return pi
 }
@@ -290,9 +291,10 @@ func over(c, a uint32) byte { return byte((c + 0xffff - a) >> 8) }
 // rgbRow fills dst with the white-composited RGB bytes of row y.
 func rgbRow(img image.Image, y int, dst []byte, pal palInfo) {
 	b := img.Bounds()
+	n := b.Dx()
 	switch m := img.(type) {
 	case *image.Paletted:
-		for x := 0; x < b.Dx(); x++ {
+		for x := 0; x < n; x++ {
 			i := int(m.ColorIndexAt(b.Min.X+x, y))
 			if i >= len(pal.rgb) {
 				i = len(pal.rgb) - 1
@@ -301,21 +303,32 @@ func rgbRow(img image.Image, y int, dst []byte, pal palInfo) {
 		}
 	case *image.NRGBA:
 		o := m.PixOffset(b.Min.X, y)
-		for x := 0; x < b.Dx(); x++ {
+		for x := 0; x < n; x++ {
 			p := m.Pix[o+4*x : o+4*x+4]
 			a := uint32(p[3])
+			if a == 255 {
+				dst[3*x], dst[3*x+1], dst[3*x+2] = p[0], p[1], p[2]
+				continue
+			}
 			for k := 0; k < 3; k++ {
 				dst[3*x+k] = byte((uint32(p[k])*a + 255*(255-a) + 127) / 255)
 			}
 		}
+	case *image.RGBA: // premultiplied
+		o := m.PixOffset(b.Min.X, y)
+		for x := 0; x < n; x++ {
+			p := m.Pix[o+4*x : o+4*x+4]
+			inv := 255 - uint32(p[3])
+			dst[3*x], dst[3*x+1], dst[3*x+2] = byte(uint32(p[0])+inv), byte(uint32(p[1])+inv), byte(uint32(p[2])+inv)
+		}
 	case *image.Gray:
 		o := m.PixOffset(b.Min.X, y)
-		for x := 0; x < b.Dx(); x++ {
+		for x := 0; x < n; x++ {
 			v := m.Pix[o+x]
 			dst[3*x], dst[3*x+1], dst[3*x+2] = v, v, v
 		}
 	default:
-		for x := 0; x < b.Dx(); x++ {
+		for x := 0; x < n; x++ {
 			r, g, bl, a := img.At(b.Min.X+x, y).RGBA()
 			dst[3*x], dst[3*x+1], dst[3*x+2] = over(r, a), over(g, a), over(bl, a)
 		}
@@ -368,7 +381,10 @@ func decodeBMP(b []byte) (image.Image, error) {
 			n = 256
 		}
 		po := 14 + hs
-		if po+int64(n)*4 > off {
+		if avail := int((off - po) / 4); n > avail { // short palette: use what is there
+			n = avail
+		}
+		if n < 1 {
 			return nil, fmt.Errorf("bad bitmap palette")
 		}
 		pal := make(color.Palette, n)
@@ -382,7 +398,7 @@ func decodeBMP(b []byte) (image.Image, error) {
 		}
 		return img, nil
 	}
-	img := image.NewRGBA(rect)
+	img := image.NewNRGBA(rect)
 	step := bpp / 8
 	for y := int64(0); y < h; y++ {
 		src := rowAt(y)
@@ -481,9 +497,9 @@ func writeImagePDF(bw *bufio.Writer, im *pdfImage, paperW, paperH float64) error
 	obj(3, fmt.Sprintf("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %s %s] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>", num(pw), num(ph)))
 	obj(4, fmt.Sprintf("<< /Length %d >>\nstream\n%sendstream", len(content), content))
 	offs[5] = c.n
-	dec := ""
+	dec := im.parms
 	if im.decode != "" {
-		dec = " /Decode " + im.decode
+		dec = " /Decode " + im.decode + dec
 	}
 	c.printf("5 0 obj\n<< /Type /XObject /Subtype /Image /Width %d /Height %d /ColorSpace /%s /BitsPerComponent 8 /Filter /%s%s /Length %d >>\nstream\n",
 		im.w, im.h, im.cs, im.filter, dec, len(im.data))

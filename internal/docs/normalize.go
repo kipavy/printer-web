@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -168,8 +170,8 @@ func Normalize(ctx context.Context, in string, k Kind, paperW, paperH float64, t
 
 // tiffToPDF runs tiff2pdf, then (when a paper size is known) a Ghostscript
 // pdfwrite pass fitting the page onto the paper, so the print path always
-// gets a PDF that matches the selected sheet. TIFFs stay on a portrait page
-// (no landscape auto-switch: tiff2pdf's page orientation is not inspected).
+// gets a PDF that matches the selected sheet. A landscape TIFF (by the first
+// /MediaBox of the tiff2pdf output) switches a portrait sheet to landscape.
 func tiffToPDF(ctx context.Context, in, out string, paperW, paperH float64, tmp string) error {
 	if paperW <= 0 || paperH <= 0 {
 		_, err := run(ctx, tiffArgs(in, out))
@@ -183,6 +185,52 @@ func tiffToPDF(ctx context.Context, in, out string, paperW, paperH float64, tmp 
 	if _, err := run(ctx, tiffArgs(in, raw)); err != nil {
 		return err
 	}
+	if w, h, ok := firstMediaBox(raw); ok && w > h && paperW < paperH {
+		paperW, paperH = paperH, paperW
+	}
 	_, err = run(ctx, tiffFitArgs(raw, out, paperW, paperH))
 	return err
+}
+
+// firstMediaBox returns the size of the first /MediaBox [x0 y0 x1 y1] found in
+// the first 64 KiB of the PDF at path.
+func firstMediaBox(path string) (w, h float64, ok bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer f.Close()
+	buf := make([]byte, 64*1024)
+	n, _ := io.ReadFull(f, buf)
+	return parseMediaBox(buf[:n])
+}
+
+func parseMediaBox(b []byte) (w, h float64, ok bool) {
+	i := bytes.Index(b, []byte("/MediaBox"))
+	if i < 0 {
+		return 0, 0, false
+	}
+	b = b[i+len("/MediaBox"):]
+	b = bytes.TrimLeft(b, " \t\r\n")
+	if len(b) == 0 || b[0] != '[' {
+		return 0, 0, false
+	}
+	end := bytes.IndexByte(b, ']')
+	if end < 0 {
+		return 0, 0, false
+	}
+	f := strings.Fields(string(b[1:end]))
+	if len(f) != 4 {
+		return 0, 0, false
+	}
+	var v [4]float64
+	for k := range v {
+		x, err := strconv.ParseFloat(f[k], 64)
+		if err != nil || math.IsNaN(x) || math.IsInf(x, 0) {
+			return 0, 0, false
+		}
+		v[k] = x
+	}
+	w, h = math.Abs(v[2]-v[0]), math.Abs(v[3]-v[1])
+	return w, h, w > 0 && h > 0
 }
