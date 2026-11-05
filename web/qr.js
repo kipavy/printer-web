@@ -96,5 +96,11 @@
     $("#posterBtn").onclick = printPoster;
     $("#browserBtn").onclick = () => window.print();
   }
+  // coming back through the back button restores the page with the button disabled
+  window.addEventListener("pageshow", (e) => {
+    if (!e.persisted) return;
+    $("#posterBtn").disabled = !qrCanvas;
+    $("#msg").textContent = t("qr_hint");
+  });
   init();
 })();

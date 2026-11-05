@@ -17,19 +17,31 @@
     jobs: { queue: [], history: [] },
     qOpen: false
   };
+  const pending = new Set();
   const thumbs = new Map(); // page number -> canvas | false (failed)
   let docToken = 0;
+  let keyFor = { id: null, key: "" }; // idempotency key per draft
+  let submitting = false;
 
   // ---------- helpers ----------
+  const API_TIMEOUT = 8000;
   async function api(method, url, body) {
     const init = { method: method, headers: {} };
     if (method !== "GET") init.headers["X-Requested-With"] = "printer-web";
-    if (body instanceof FormData) init.body = body;
-    else if (body !== undefined) { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(body); }
-    let r;
-    try { r = await fetch(url, init); } catch (e) { throw { key: "network" }; }
-    let data = null;
-    if (r.status !== 204) { try { data = await r.json(); } catch (e) { data = null; } }
+    let timer = 0;
+    if (body instanceof FormData) init.body = body; // uploads: no timeout
+    else {
+      const ctl = new AbortController();
+      init.signal = ctl.signal;
+      timer = setTimeout(() => ctl.abort(), API_TIMEOUT);
+      if (body !== undefined) { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(body); }
+    }
+    let r, data = null;
+    try {
+      r = await fetch(url, init);
+      if (r.status !== 204) { try { data = await r.json(); } catch (e) { data = null; } }
+    } catch (e) { throw { key: "network" }; }
+    finally { clearTimeout(timer); }
     if (!r.ok) throw { key: (data && data.error) || "internal", status: r.status };
     return data;
   }
@@ -89,13 +101,27 @@
   function criticalReason() { const rs = reasons(); return CRITICAL.find((c) => rs.includes(c)) || ""; }
   function blockingReason() { const rs = reasons(); return BLOCKING.find((c) => rs.includes(c)) || ""; }
 
+  let printerBusy = false, printerAgain = false, printerSeq = 0;
   async function refreshPrinter() {
+    if (printerBusy) { printerAgain = true; return; }
+    printerBusy = true;
+    const seq = ++printerSeq;
+    try {
+      await refreshPrinterOnce(seq);
+    } finally {
+      printerBusy = false;
+      if (printerAgain) { printerAgain = false; refreshPrinter(); }
+    }
+  }
+  async function refreshPrinterOnce(seq) {
     try {
       const p = await api("GET", "/api/printer");
+      if (seq !== printerSeq) return; // stale
       S.printer = p;
       // an unreachable printer reports empty capabilities: keep the last good ones
       if (p.state !== "unreachable") S.caps = p.caps || {};
     } catch (e) {
+      if (seq !== printerSeq) return;
       S.printer = { state: "unreachable", reasons: [], supplies: [], caps: S.caps };
     }
     renderPrinter();
@@ -127,10 +153,11 @@
     $("#tonerBox").hidden = sup.length === 0;
     $("#toner").innerHTML = sup.map((s) => {
       const col = supplyColor(s);
-      return '<div><span>' + esc(s.name) + '</span><span class="t"><i style="width:' + s.level + "%;background:" + col + '"></i></span><span>' + s.level + " %</span></div>";
+      return '<div><span>' + esc(s.name) + '</span><span class="t"><i style="width:' + level(s) + "%;background:" + col + '"></i></span><span>' + level(s) + " %</span></div>";
     }).join("");
   }
 
+  const level = (s) => Math.max(0, Math.min(100, Number(s.level) || 0));
   function supplyColor(s) {
     const c = String(s.color || "").toLowerCase();
     if (/^#[0-9a-f]{3,8}$/.test(c)) return c;
@@ -235,6 +262,8 @@
     if (S.doc && S.doc.pdf) { try { S.doc.pdf.destroy(); } catch (e) { /* ignore */ } }
     S.doc = null; S.est = null;
     thumbs.clear();
+    pending.clear();
+    keyFor = { id: null, key: "" };
     S.o.pages = "all"; S.o.spec = ""; $("#pagesInput").value = "";
   }
 
@@ -245,6 +274,7 @@
       const k = seg.dataset.k;
       seg.querySelectorAll("button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.v === (k === "color" ? (S.o.color ? "color" : "mono") : S.o[k]))));
     });
+    $("#file").disabled = S.uploading;
     $("#copies").textContent = S.o.copies;
     $("#allPages").setAttribute("aria-pressed", String(S.o.pages === "all"));
     $("#somePages").setAttribute("aria-pressed", String(S.o.pages === "some"));
@@ -316,7 +346,6 @@
     }
   }
 
-  const pending = new Set();
   async function loadThumb(p) {
     const d = S.doc;
     if (!d || !d.pdf || pending.has(p)) return;
@@ -329,6 +358,7 @@
       const c = document.createElement("canvas");
       c.width = Math.ceil(vp.width); c.height = Math.ceil(vp.height);
       await pg.render({ canvasContext: c.getContext("2d"), viewport: vp }).promise;
+      pg.cleanup();
       if (tok !== docToken) return;
       thumbs.set(p, c);
     } catch (e) {
@@ -361,6 +391,7 @@
       if (!info.pages) d.pages = pdf.numPages;
       const first = await pdf.getPage(1), vp = first.getViewport({ scale: 1 });
       d.landscape = vp.width > vp.height;
+      first.cleanup();
     } catch (e) {
       if (tok !== docToken) return false;
       if (!info.pages) { dropDoc(); S.notice = I18N.errMsg("expired"); return false; }
@@ -373,7 +404,7 @@
   }
 
   async function chooseFile(f) {
-    if (!f) return;
+    if (!f || S.uploading) return;
     S.notice = ""; S.uploading = true; render();
     const fd = new FormData();
     fd.append("file", f, f.name);
@@ -407,10 +438,10 @@
     if (opener && document.contains(opener)) opener.focus();
     refreshJobs();
   }
-  scrim.addEventListener("click", (e) => { if (e.target === scrim) closeSheet(); });
+  scrim.addEventListener("click", (e) => { if (e.target === scrim && !submitting) closeSheet(); });
   document.addEventListener("keydown", (e) => {
     if (scrim.hidden) return;
-    if (e.key === "Escape") { closeSheet(); return; }
+    if (e.key === "Escape") { if (!submitting) closeSheet(); return; }
     if (e.key === "Tab") { // keep focus inside the sheet
       const fs = [...dlg.querySelectorAll("button:not([disabled]),a[href],select,input")];
       if (!fs.length) { e.preventDefault(); return; }
@@ -439,7 +470,7 @@
     if (c.ppm) add(t("ps_speed"), t("ps_speed_v", { n: c.ppm }) + (c.ppmColor ? " (" + t("ps_speed_c", { n: c.ppmColor }) + ")" : ""));
     const sup = (p.supplies || []);
     const supHtml = sup.length ? '<div class="label">' + esc(t("supplies")) + '</div><div class="sup">' + sup.map((s) =>
-      "<div><span>" + esc(s.name) + '</span><span class="t"><i style="width:' + Math.max(0, s.level) + "%;background:" + supplyColor(s) + '"></i></span><span>' + (s.level >= 0 ? s.level + " %" : "?") + "</span></div>").join("") + "</div>" : "";
+      "<div><span>" + esc(s.name) + '</span><span class="t"><i style="width:' + level(s) + "%;background:" + supplyColor(s) + '"></i></span><span>' + (s.level >= 0 ? level(s) + " %" : "?") + "</span></div>").join("") + "</div>" : "";
     const where = [c.model, S.cfg.location].filter(Boolean).join(", ");
     const help = crit ? '<div class="alert warn">' + esc(t("reason." + crit + ".help")) + "</div>" : (p.state === "unreachable" ? '<div class="alert">' + esc(t("err.printer_unreachable")) + "</div>" : "");
     showSheet('<h2 id="dlgTitle">' + esc(title) + "</h2><p>" + esc(where || S.cfg.name) + "</p>" +
@@ -471,7 +502,8 @@
     const sh = est ? est.sheets : sheetsFor(sel.list.length, S.o.copies, S.o.sides);
     const cost = est && est.cost !== undefined ? fmtCost(est.cost, est.currency) : "";
     const total = tp("sheets", sh) + (cost ? " · " + cost : "");
-    let key = newKey();
+    if (keyFor.id !== d.id) keyFor = { id: d.id, key: newKey() };
+    const key = keyFor.key;
     const rows = [
       [t("r_file"), d.name],
       [t("r_pages"), S.o.pages === "all" ? t("r_pages_all", { n: sel.list.length }) : S.o.spec.trim()],
@@ -490,21 +522,27 @@
     sheetClose("cancel");
     const go = $("#go");
     go.onclick = async () => {
+      if (submitting) return;
+      submitting = true;
       go.disabled = true; // one tap only
+      $("#cancel").disabled = true;
       go.textContent = t("sending");
       $("#cerr").hidden = true;
       try {
         const job = await api("POST", "/api/jobs", { upload: d.id, key: key, pages: pagesParam(), options: o });
+        if (!job || typeof job.id !== "string" || !job.id) throw { key: "internal" };
+        submitting = false;
         // the draft now belongs to the job: back to the empty state
         dropDoc(); S.notice = ""; render();
         openProgress(job);
       } catch (e) {
+        submitting = false;
         if (e.key === "expired" || e.key === "not_found") { handleExpired(e.key); return; }
-        if (e.key !== "network") key = newKey(); // a definite refusal: a fresh key is safe
         const ce = $("#cerr");
         if (!ce) return;
         ce.textContent = I18N.errMsg(e.key); ce.hidden = false;
         go.disabled = false; go.textContent = t("retry");
+        $("#cancel").disabled = false;
       }
     };
   }
@@ -512,70 +550,87 @@
   // ---------- progress sheet ----------
   const STEP_OF = { queued: 0, preparing: 0, sending: 1, printing: 2 };
   function openProgress(job) {
-    showSheet('<h2 id="dlgTitle"></h2><div class="live" id="prog" aria-live="polite"></div><div class="actions"><button type="button" class="btn" id="ok"></button></div>');
+    showSheet('<div class="live" id="prog" aria-live="polite" aria-atomic="true"></div><div class="actions"><button type="button" class="btn" id="ok"></button></div>');
     sheetClose("ok");
-    progress = { id: job.id, sheets: job.sheets, timer: 0 };
+    progress = { id: job.id, sheets: job.sheets, timer: 0, misses: 0, done: false };
     paintProgress(job);
-    pollJob();
+    pollJob(1500);
   }
-  function pollJob() {
+  function pollJob(delay) {
     const cur = progress;
-    if (!cur) return;
+    if (!cur || cur.done) return;
+    clearTimeout(cur.timer);
     cur.timer = setTimeout(async () => {
       if (progress !== cur) return;
+      if (document.hidden) { pollJob(1500); return; } // resumes on visibilitychange
       try {
         const j = await api("GET", "/api/jobs/" + encodeURIComponent(cur.id));
         if (progress !== cur) return;
+        cur.misses = 0;
         paintProgress(j);
-        if (["done", "sent", "failed", "canceled"].includes(j.state)) { refreshJobs(); return; }
+        if (["done", "sent", "failed", "canceled"].includes(j.state)) { cur.done = true; refreshJobs(); return; }
       } catch (e) {
         if (progress !== cur) return;
-        if (e.key === "not_found") { paintProgress(null); return; }
+        // the job may not be visible for a moment: retry twice before giving up
+        if (e.key === "not_found" && ++cur.misses > 2) { cur.done = true; paintProgress(null); return; }
       }
-      pollJob();
-    }, 1500);
+      pollJob(1500);
+    }, delay);
   }
   function paintProgress(j) {
-    const title = $("#dlgTitle"), prog = $("#prog"), ok = $("#ok");
-    if (!title || !prog) return;
+    const prog = $("#prog"), ok = $("#ok");
+    if (!prog || !ok) return;
+    let title = "";
     const sheets = tp("sheets", (j && j.sheets) || (progress && progress.sheets) || 1);
     const steps = [t("step_prepare"), t("step_send"), t("step_print")];
     const stepList = (i) => '<div class="progress">' + steps.map((s, k) => '<div class="stepl ' + (k < i ? "done" : k === i ? "on" : "") + '"><i aria-hidden="true">' + (k < i ? "✓" : "") + "</i>" + esc(s) + "</div>").join("") + "</div>";
     let h = "", okLabel = t("close"), okCls = "btn";
     if (!j) {
-      title.textContent = t("failed_title");
+      title = t("failed_title");
       h = '<div class="alert bad">' + esc(t("lost_job")) + "</div>";
     } else if (j.state in STEP_OF) {
-      title.textContent = j.state === "queued" ? t("prog_wait_title") : t("prog_title");
+      title = j.state === "queued" ? t("prog_wait_title") : t("prog_title");
       h = "<p>" + esc(t("prog_sub")) + "</p>" + (j.state === "queued" && j.position > 1 ? "<p>" + esc(t("prog_queued", { n: j.position - 1 })) + "</p>" : "") + stepList(STEP_OF[j.state]);
     } else if (j.state === "done" || j.state === "sent") {
-      title.textContent = j.state === "done" ? t("done_title") : t("sent_title");
+      title = j.state === "done" ? t("done_title") : t("sent_title");
       h = "<p>" + esc(t(j.state === "done" ? "done_sub" : "sent_sub", { sheets: sheets })) + '</p><div class="tray"><div class="out"></div></div>';
       okLabel = t("finish"); okCls = "print";
     } else if (j.state === "canceled") {
-      title.textContent = t("canceled_title");
+      title = t("canceled_title");
       h = "<p>" + esc(t("canceled_sub")) + "</p>";
     } else { // failed
-      title.textContent = t("failed_title");
+      title = t("failed_title");
       const b = criticalReason();
       let msg = I18N.errMsg(j.error || "internal");
       if (b && (j.error === "printer_error" || j.error === "printer_unreachable" || !j.error)) msg = t("reason." + b) + ". " + t("reason." + b + ".help");
       h = '<div class="alert bad">' + esc(msg) + "</div>";
     }
-    prog.innerHTML = h;
-    ok.textContent = okLabel;
-    ok.className = okCls;
+    // the title lives inside the live region so screen readers announce it; skip no-op writes
+    const html = '<h2 id="dlgTitle">' + esc(title) + "</h2>" + h;
+    if (prog.dataset.html !== html) { prog.innerHTML = html; prog.dataset.html = html; }
+    if (ok.textContent !== okLabel) ok.textContent = okLabel;
+    if (ok.className !== okCls) ok.className = okCls;
   }
 
   // ---------- queue and history ----------
   let lastQ = "", lastH = "";
+  let jobsBusy = false, jobsAgain = false, jobsSeq = 0;
   async function refreshJobs() {
+    if (jobsBusy) { jobsAgain = true; return; }
+    jobsBusy = true;
+    const seq = ++jobsSeq;
     try {
       const r = await api("GET", "/api/jobs");
-      S.jobs = { queue: r.queue || [], history: r.history || [] };
-    } catch (e) { return; }
-    renderQueue();
-    renderHistory();
+      if (seq === jobsSeq) {
+        S.jobs = { queue: r.queue || [], history: r.history || [] };
+        renderQueue();
+        renderHistory();
+      }
+    } catch (e) { /* keep the last list */ }
+    finally {
+      jobsBusy = false;
+      if (jobsAgain) { jobsAgain = false; refreshJobs(); }
+    }
   }
 
   function renderQueue() {
@@ -586,7 +641,7 @@
       if (m.state !== "queued") sum = t("queue_yours_now");
       else sum = before > 0 ? tp("queue_before", before) : t("queue_yours_next");
     } else sum = q.length ? tp("queue_others", q.length) : t("queue_none");
-    $("#qsum").textContent = sum;
+    if ($("#qsum").textContent !== sum) $("#qsum").textContent = sum;
     const tg = $("#qToggle");
     tg.hidden = q.length === 0;
     tg.textContent = S.qOpen ? t("queue_hide") : t("queue_all");
@@ -675,7 +730,11 @@
 
     setInterval(() => { if (!document.hidden) refreshPrinter(); }, 10000);
     setInterval(() => { if (!document.hidden) refreshJobs(); }, 5000);
-    document.addEventListener("visibilitychange", () => { if (!document.hidden) { refreshPrinter(); refreshJobs(); } });
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) return;
+      refreshPrinter(); refreshJobs();
+      if (progress && !progress.done) pollJob(0);
+    });
   }
   init();
 })();

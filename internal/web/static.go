@@ -25,7 +25,11 @@ func (s *Server) staticHandler() http.Handler {
 				return
 			}
 		}
-		if p == "/" || p == "/index.html" {
+		switch {
+		case strings.HasPrefix(p, "/vendor/"):
+			// pinned third-party files: safe to cache
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+		case p == "/" || strings.HasSuffix(p, ".html") || strings.HasSuffix(p, ".js") || strings.HasSuffix(p, ".css"):
 			w.Header().Set("Cache-Control", "no-cache")
 		}
 		fsrv.ServeHTTP(w, r)

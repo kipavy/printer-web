@@ -564,6 +564,17 @@ func TestStaticServedEmbedded(t *testing.T) {
 			t.Errorf("%s: %d %q", tc.path, resp.StatusCode, resp.Header.Get("Content-Type"))
 		}
 	}
+	for path, want := range map[string]string{
+		"/vendor/pdf.min.js":                           "public, max-age=86400",
+		"/vendor/fonts/BricolageGrotesque-latin.woff2": "public, max-age=86400",
+		"/app.js":  "no-cache",
+		"/app.css": "no-cache",
+		"/":        "no-cache",
+	} {
+		if resp, _ := c.get(path); resp.Header.Get("Cache-Control") != want {
+			t.Errorf("%s: Cache-Control %q, want %q", path, resp.Header.Get("Cache-Control"), want)
+		}
+	}
 	for _, p := range []string{"/vendor", "/vendor/", "/vendor/fonts"} {
 		if resp, _ := c.get(p); resp.StatusCode != 404 {
 			t.Errorf("%s: %d, want 404", p, resp.StatusCode)

@@ -47,7 +47,7 @@ header.top{display:flex;align-items:center;justify-content:space-between;gap:12p
 .mark i{width:9px;height:9px;border-radius:50%}
 .brand h1{font-size:1.45rem;font-weight:800}
 .brand small{display:block;color:var(--ink-soft);font-size:.85rem;font-family:var(--body)}
-.status{display:flex;align-items:center;gap:10px;background:var(--sheet);border:1px solid var(--line);border-radius:999px;padding:6px 12px 6px 10px;cursor:pointer}
+.status{min-height:44px;display:flex;align-items:center;gap:10px;background:var(--sheet);border:1px solid var(--line);border-radius:999px;padding:6px 12px 6px 10px;cursor:pointer}
 .dot{width:10px;height:10px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft)}
 .status[data-state="warn"] .dot{background:var(--warn);box-shadow:0 0 0 4px var(--warn-soft)}
 .status[data-state="busy"] .dot{background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft);animation:pulse 1.2s infinite}
@@ -99,7 +99,7 @@ header.top{display:flex;align-items:center;justify-content:space-between;gap:12p
 .stepper button{width:48px;height:48px;border:0;background:transparent;font-size:1.4rem;cursor:pointer}
 .stepper output{min-width:44px;text-align:center;font-weight:700;font-size:1.15rem;font-variant-numeric:tabular-nums}
 .chips{display:flex;gap:8px;flex-wrap:wrap}
-.chip{border:1px solid var(--line);background:var(--paper);border-radius:999px;padding:8px 14px;min-height:42px;cursor:pointer;font-weight:700}
+.chip{border:1px solid var(--line);background:var(--paper);border-radius:999px;padding:8px 14px;min-height:44px;cursor:pointer;font-weight:700}
 .chip[aria-pressed="true"]{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
 .pagesinput{border:1px solid var(--line);border-radius:12px;padding:10px 12px;min-height:44px;background:var(--paper);width:9.5em}
 .err{color:var(--bad);font-size:.88rem;margin-top:6px}
@@ -227,3 +227,4 @@ select{border:1px solid var(--line);border-radius:12px;padding:10px 12px;min-hei
   .page.portrait{width:150px;height:212px}
   .page.landscape{width:212px;height:150px}
 }
+.card:has(#file:focus-visible) label.btn{outline:3px solid var(--accent);outline-offset:2px}
