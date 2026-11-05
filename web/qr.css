@@ -1,0 +1,32 @@
+/* QR poster page: A4 layout on screen and in the browser's own print. */
+.qrpage{padding-block:16px 40px}
+.qrwrap{max-width:560px;margin:0 auto;display:grid;gap:16px}
+.tools{display:grid;gap:10px;justify-items:start}
+.tools .print{width:100%;justify-content:center}
+.tools .btn{color:inherit;display:inline-flex;align-items:center;text-decoration:none}
+.poster{color-scheme:light;--k:#1b1d22;background:#fff;color:#16191f;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);aspect-ratio:210/297;width:100%;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2.2%;padding:6% 7%;text-align:center;overflow:hidden}
+.poster .mark{grid-template-columns:repeat(4,12px)}
+.poster .mark i{width:12px;height:12px}
+.poster h1{font-size:clamp(1.6rem,8vw,2.6rem);font-weight:800;line-height:1.05;overflow-wrap:anywhere}
+.poster .loc{margin:0;color:#5b6270;font-size:clamp(.9rem,3.6vw,1.2rem)}
+.qrbox{width:68%;aspect-ratio:1}
+.qrbox canvas,.qrbox img{width:100%!important;height:auto!important;display:block;image-rendering:pixelated}
+.poster .url{margin:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:700;font-size:clamp(.85rem,4vw,1.5rem);overflow-wrap:anywhere}
+.poster .scan{margin:0;font-size:clamp(.95rem,4.2vw,1.5rem);font-weight:700}
+
+@media print{
+  @page{size:A4;margin:0}
+  html,body{background:#fff!important}
+  .qrpage{padding:0}
+  .noprint{display:none!important}
+  .qrwrap{max-width:none;display:block}
+  .poster{width:210mm;height:297mm;aspect-ratio:auto;border:0;border-radius:0;box-shadow:none;gap:8mm;padding:20mm 18mm;page-break-after:avoid}
+  .poster .mark{grid-template-columns:repeat(4,5mm);gap:2mm}
+  .poster .mark i{width:5mm;height:5mm}
+  .poster h1{font-size:30pt}
+  .poster .loc{font-size:15pt}
+  .qrbox{width:130mm}
+  .poster .url{font-size:22pt}
+  .poster .scan{font-size:18pt}
+}
