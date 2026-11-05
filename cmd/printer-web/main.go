@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -20,6 +21,9 @@ import (
 	webassets "github.com/kipavy/printer-web/web"
 )
 
+// shutdownGrace bounds how long in-flight HTTP requests may finish.
+const shutdownGrace = 3 * time.Second
+
 func main() { os.Exit(run()) }
 
 func run() int {
@@ -28,17 +32,23 @@ func run() int {
 		fmt.Fprintln(os.Stderr, "printer-web: configuration error:", err)
 		return 2
 	}
-	b, err := backend.New(cfg)
+	// A fixed directory, emptied at start: files left by a crash or a kill
+	// are deleted on the next start.
+	dir := filepath.Join(os.TempDir(), "printer-web")
+	if err := os.RemoveAll(dir); err != nil {
+		log.Printf("cannot clean temp dir %s: %v", dir, err)
+		return 1
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("cannot create temp dir %s: %v", dir, err)
+		return 1
+	}
+	defer os.RemoveAll(dir)
+	b, err := backend.New(cfg, dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "printer-web: configuration error:", err)
 		return 2
 	}
-	dir, err := os.MkdirTemp("", "printer-web-")
-	if err != nil {
-		log.Printf("cannot create temp dir: %v", err)
-		return 1
-	}
-	defer os.RemoveAll(dir)
 
 	drafts := queue.NewDrafts(dir, cfg.DraftTTL, nil)
 	q := queue.NewQueue(b, drafts, dir, nil)
@@ -89,8 +99,10 @@ func run() int {
 	case <-sig.Done():
 		log.Print("shutting down")
 	}
-	// No new Submit after Shutdown; then let the worker drain.
-	sctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// No new Submit after Shutdown; then let the worker drain. The grace is
+	// short so the whole stop (plus at most 5 s for a child process to exit)
+	// stays under Docker's default 10 s.
+	sctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	_ = srv.Shutdown(sctx)
 	cancel()
 	stopWorker()

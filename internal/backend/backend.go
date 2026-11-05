@@ -6,8 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -90,28 +92,40 @@ type Backend interface {
 	Cancel(ctx context.Context, h Handle) error
 }
 
-// New builds the backend selected by cfg.Backend.
-func New(cfg config.Config) (Backend, error) {
+// New builds the backend selected by cfg.Backend. tmp holds converted
+// files.
+func New(cfg config.Config, tmp string) (Backend, error) {
+	if tmp == "" {
+		tmp = os.TempDir()
+	}
 	switch cfg.Backend {
 	case "ipp", "cups":
-		return newIPP(cfg), nil
+		b := newIPP(cfg)
+		b.tmp = tmp
+		return b, nil
 	case "raw":
-		return newRaw(cfg), nil
+		b := newRaw(cfg)
+		b.tmp = tmp
+		return b, nil
 	case "command":
 		return newCommand(cfg)
 	}
 	return nil, fmt.Errorf("backend: unknown backend %q", cfg.Backend)
 }
 
-// converter renders the PDF into the printer's format and returns a file path.
-type converter func(ctx context.Context, pdf, format string, color bool, tmp string) (string, error)
+// converter renders the PDF into the printer's format, fitted to a paperW x
+// paperH sheet (points), and returns a file path.
+type converter func(ctx context.Context, pdf, format string, color bool, paperW, paperH float64, tmp string, extra ...string) (string, error)
 
 var _ converter = docs.Convert
 
+// sheet is a paper size in points.
+type sheet struct{ w, h float64 }
+
 // convertAndRun converts pdf, calls fn with the result and its exact size,
 // then removes the converted file (never the input pdf).
-func convertAndRun(ctx context.Context, conv converter, tmp, pdf, format string, color bool, fn func(path string, size int64) error) error {
-	out, err := conv(ctx, pdf, format, color, tmp)
+func convertAndRun(ctx context.Context, conv converter, tmp, pdf, format string, color bool, paper sheet, extra []string, fn func(path string, size int64) error) error {
+	out, err := conv(ctx, pdf, format, color, paper.w, paper.h, tmp, extra...)
 	if err != nil {
 		return err
 	}
@@ -135,6 +149,63 @@ func samePath(a, b string) bool {
 
 // clampCopies bounds the copy count to 1..99.
 func clampCopies(n int) int { return min(max(n, 1), 99) }
+
+// papers lists the friendly paper names in display order, with the prefix of
+// their PWG media names, the canonical PWG name and the size in points.
+var papers = []struct {
+	name, prefix, pwg string
+	w, h              float64
+}{
+	{"A4", "iso_a4_", "iso_a4_210x297mm", 595.28, 841.89},
+	{"Letter", "na_letter_", "na_letter_8.5x11in", 612, 792},
+	{"Legal", "na_legal_", "na_legal_8.5x14in", 612, 1008},
+	{"A5", "iso_a5_", "iso_a5_148x210mm", 419.53, 595.28},
+	{"A3", "iso_a3_", "iso_a3_297x420mm", 841.89, 1190.55},
+	{"A6", "iso_a6_", "iso_a6_105x148mm", 297.64, 419.53},
+	{"B5", "iso_b5_", "iso_b5_176x250mm", 498.9, 708.66},
+}
+
+// PaperSize returns the portrait size in points of a paper name (case
+// insensitive); ok is false for unknown names.
+func PaperSize(name string) (w, h float64, ok bool) {
+	for _, p := range papers {
+		if strings.EqualFold(p.name, strings.TrimSpace(name)) {
+			return p.w, p.h, true
+		}
+	}
+	return 0, 0, false
+}
+
+// sheetFor is the size of the chosen paper, else of the first known default
+// paper, else A4.
+func sheetFor(paper string, defaults []string) sheet {
+	for _, n := range append([]string{paper}, defaults...) {
+		if w, h, ok := PaperSize(n); ok {
+			return sheet{w, h}
+		}
+	}
+	return sheet{595.28, 841.89}
+}
+
+// stateLog logs a change to or from "unreachable" once per change.
+type stateLog struct {
+	mu   sync.Mutex
+	down bool
+}
+
+func (s *stateLog) note(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if (err != nil) == s.down {
+		return
+	}
+	s.down = err != nil
+	if err != nil {
+		log.Printf("printer unreachable: %v", err)
+	} else {
+		log.Print("printer reachable again")
+	}
+}
 
 const failTTL = 3 * time.Second
 

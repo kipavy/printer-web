@@ -26,6 +26,8 @@ var safeValue = regexp.MustCompile(`^[A-Za-z0-9._+x-]*$`)
 type commandBackend struct {
 	cfg     config.Config
 	timeout time.Duration
+	probe   *probe // optional PRINTER_PROBE check
+	state   stateLog
 }
 
 func newCommand(cfg config.Config) (*commandBackend, error) {
@@ -35,19 +37,30 @@ func newCommand(cfg config.Config) (*commandBackend, error) {
 			return nil, fmt.Errorf("PRINTER_COMMAND: %q must be a whole element, not part of %q", "{mono_flag}/{landscape_flag}", t)
 		}
 	}
-	return &commandBackend{cfg: cfg, timeout: submitTimeout}, nil
+	b := &commandBackend{cfg: cfg, timeout: submitTimeout}
+	if cfg.PrinterProbe != "" {
+		b.probe = newProbe(cfg.PrinterProbe)
+	}
+	return b, nil
 }
 
 func (b *commandBackend) Caps(context.Context) (Caps, error) {
 	return declaredCaps(b.cfg), nil
 }
 
-func (b *commandBackend) Status(context.Context) (Status, error) {
+// Status checks that the program exists and, with PRINTER_PROBE, that the
+// printer accepts TCP connections.
+func (b *commandBackend) Status(ctx context.Context) (Status, error) {
 	if len(b.cfg.Command) == 0 {
 		return Status{State: StateUnreachable}, nil
 	}
 	if _, err := exec.LookPath(b.cfg.Command[0]); err != nil {
+		b.state.note(err)
 		return Status{State: StateUnreachable}, nil
+	}
+	b.state.note(nil)
+	if b.probe != nil {
+		return b.probe.status(ctx)
 	}
 	return Status{State: StateReady}, nil
 }
@@ -133,10 +146,14 @@ func (w *tailWriter) Write(p []byte) (int, error) {
 }
 
 func (b *commandBackend) Submit(ctx context.Context, pdf, name string, o Options) (Handle, error) {
+	if b.probe != nil {
+		b.probe.busy.Add(1)
+		defer b.probe.busy.Add(-1)
+	}
+	o = withDefaultPaper(o, b.cfg.Declared.Papers)
 	if err := validate(o); err != nil {
 		return Handle{}, err
 	}
-	o = withDefaultPaper(o, b.cfg.Declared.Papers)
 	argv := buildArgv(b.cfg.Command, pdf, name, o)
 	if len(argv) == 0 || argv[0] == "" {
 		return Handle{}, errors.New("empty print command")

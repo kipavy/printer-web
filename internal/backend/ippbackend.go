@@ -17,7 +17,7 @@ import (
 const (
 	cacheTTL      = 10 * time.Second
 	submitTimeout = 10 * time.Minute
-	queryTimeout  = 10 * time.Second
+	queryTimeout  = 5 * time.Second // below the API's 6 s status timeout
 )
 
 // ippBackend drives an IPP printer or a CUPS queue (same protocol).
@@ -27,6 +27,7 @@ type ippBackend struct {
 	convert converter
 	tmp     string
 	cache   *cache
+	state   stateLog
 }
 
 func newIPP(cfg config.Config) *ippBackend {
@@ -41,18 +42,6 @@ func newIPP(cfg config.Config) *ippBackend {
 
 // Document formats in order of preference.
 var formatOrder = []string{"application/pdf", "image/pwg-raster", "image/urf", "application/postscript"}
-
-// papers lists the friendly paper names in display order, with the prefix of
-// their PWG media names and the canonical PWG name.
-var papers = []struct{ name, prefix, pwg string }{
-	{"A4", "iso_a4_", "iso_a4_210x297mm"},
-	{"Letter", "na_letter_", "na_letter_8.5x11in"},
-	{"Legal", "na_legal_", "na_legal_8.5x14in"},
-	{"A5", "iso_a5_", "iso_a5_148x210mm"},
-	{"A3", "iso_a3_", "iso_a3_297x420mm"},
-	{"A6", "iso_a6_", "iso_a6_105x148mm"},
-	{"B5", "iso_b5_", "iso_b5_176x250mm"},
-}
 
 // friendlyPaper maps a PWG media name to a friendly name ("" if unknown).
 func friendlyPaper(media string) string {
@@ -166,8 +155,10 @@ func (b *ippBackend) Status(ctx context.Context) (Status, error) {
 		if ctx.Err() != nil {
 			return Status{}, ctx.Err()
 		}
+		b.state.note(err)
 		return Status{State: StateUnreachable}, nil
 	}
+	b.state.note(nil)
 	st := v.(Status)
 	st.Reasons, st.Supplies = slices.Clone(st.Reasons), slices.Clone(st.Supplies)
 	return st, nil
@@ -251,7 +242,8 @@ func (b *ippBackend) Submit(ctx context.Context, pdf, name string, o Options) (H
 	ctx, cancel := context.WithTimeout(ctx, submitTimeout)
 	defer cancel()
 	var id int
-	err = convertAndRun(ctx, b.convert, b.tmp, pdf, format, o.Color, func(path string, size int64) error {
+	paper := sheetFor(o.Paper, c.Papers)
+	err = convertAndRun(ctx, b.convert, b.tmp, pdf, format, o.Color, paper, nil, func(path string, size int64) error {
 		f, err := os.Open(path)
 		if err != nil {
 			return err

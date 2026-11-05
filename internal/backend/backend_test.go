@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+
 	"net"
 	"os"
 	"path/filepath"
@@ -153,7 +154,7 @@ func submitIPP(t *testing.T, formats []string, o Options, setup ...func(*ipptest
 	pdf := writeFile(t, "in.pdf", "%PDF-1.4 fake")
 	var asked []string
 	var converted string
-	b.convert = func(_ context.Context, in, format string, _ bool, tmp string) (string, error) {
+	b.convert = func(_ context.Context, in, format string, _ bool, _, _ float64, tmp string, _ ...string) (string, error) {
 		asked = append(asked, format)
 		if format == "application/pdf" {
 			return in, nil
@@ -305,7 +306,7 @@ func TestIPPTrackAborted(t *testing.T) {
 
 func TestNewSelectsBackend(t *testing.T) {
 	for name, want := range map[string]string{"ipp": "*backend.ippBackend", "cups": "*backend.ippBackend", "raw": "*backend.rawBackend", "command": "*backend.commandBackend"} {
-		b, err := New(config.Config{Backend: name, PrinterURI: "ipp://127.0.0.1:631/x"})
+		b, err := New(config.Config{Backend: name, PrinterURI: "ipp://127.0.0.1:631/x"}, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -313,7 +314,7 @@ func TestNewSelectsBackend(t *testing.T) {
 			t.Errorf("%s: %s", name, got)
 		}
 	}
-	if _, err := New(config.Config{Backend: "nope"}); err == nil {
+	if _, err := New(config.Config{Backend: "nope"}, ""); err == nil {
 		t.Error("want error")
 	}
 }
@@ -364,7 +365,7 @@ func TestRawSubmitPS(t *testing.T) {
 	addr, ch := listen(t)
 	b := newRaw(rawConfig(addr, "ps"))
 	var asked string
-	b.convert = func(_ context.Context, _, format string, _ bool, tmp string) (string, error) {
+	b.convert = func(_ context.Context, _, format string, _ bool, _, _ float64, tmp string, _ ...string) (string, error) {
 		asked = format
 		p := filepath.Join(tmp, "o.ps")
 		return p, os.WriteFile(p, []byte("%!PS-Adobe-3.0\nshowpage\n"), 0o600)
@@ -377,7 +378,7 @@ func TestRawSubmitPS(t *testing.T) {
 	if asked != "application/postscript" || !strings.HasPrefix(got, "%!PS") {
 		t.Errorf("asked %q got %q", asked, got)
 	}
-	if strings.Count(got, "%!PS") != 2 {
+	if strings.Count(got, "%!PS-Adobe") != 2 {
 		t.Errorf("copies: %q", got)
 	}
 	if entries, _ := os.ReadDir(b.tmp); len(entries) != 0 {
@@ -389,7 +390,7 @@ func TestRawSubmitPCL(t *testing.T) {
 	addr, ch := listen(t)
 	b := newRaw(rawConfig(addr, "pcl"))
 	var asked string
-	b.convert = func(_ context.Context, _, format string, _ bool, tmp string) (string, error) {
+	b.convert = func(_ context.Context, _, format string, _ bool, _, _ float64, tmp string, _ ...string) (string, error) {
 		asked = format
 		p := filepath.Join(tmp, "o.pcl")
 		return p, os.WriteFile(p, []byte("\x1bE"), 0o600)
@@ -754,7 +755,7 @@ func TestSubmitErrorCleansTemp(t *testing.T) {
 	b, srv := newTestIPP(t, nil)
 	srv.FailOp(ipp.OpPrintJob, ipp.StatusNotPossible)
 	b.tmp = t.TempDir()
-	b.convert = func(_ context.Context, _, _ string, _ bool, tmp string) (string, error) {
+	b.convert = func(_ context.Context, _, _ string, _ bool, _, _ float64, tmp string, _ ...string) (string, error) {
 		p := filepath.Join(tmp, "conv.bin")
 		return p, os.WriteFile(p, []byte("X"), 0o600)
 	}
@@ -788,14 +789,14 @@ func TestRawCopiesClamped(t *testing.T) {
 	addr, ch := listen(t)
 	b := newRaw(rawConfig(addr, "ps"))
 	b.tmp = t.TempDir()
-	b.convert = func(_ context.Context, _, _ string, _ bool, tmp string) (string, error) {
+	b.convert = func(_ context.Context, _, _ string, _ bool, _, _ float64, tmp string, _ ...string) (string, error) {
 		p := filepath.Join(tmp, "o.ps")
-		return p, os.WriteFile(p, []byte("%!PS\n"), 0o600)
+		return p, os.WriteFile(p, []byte("%!PS\nshowpage\n"), 0o600)
 	}
 	if _, err := b.Submit(ctx(t), writeFile(t, "a.pdf", "x"), "n", Options{Copies: 1000}); err != nil {
 		t.Fatal(err)
 	}
-	if n := strings.Count(string(<-ch), "%!PS"); n != 99 {
+	if n := strings.Count(string(<-ch), "showpage"); n != 99 {
 		t.Errorf("copies = %d", n)
 	}
 }
@@ -838,11 +839,11 @@ func TestCommandEmptyElementDropped(t *testing.T) {
 
 func TestCommandEmbeddedFlagRejected(t *testing.T) {
 	for _, tok := range []string{"--x={mono_flag}", "{landscape_flag}y"} {
-		if _, err := New(config.Config{Backend: "command", Command: []string{"prog", tok}}); err == nil {
+		if _, err := New(config.Config{Backend: "command", Command: []string{"prog", tok}}, ""); err == nil {
 			t.Errorf("%q accepted", tok)
 		}
 	}
-	if _, err := New(config.Config{Backend: "command", Command: []string{"prog", "{mono_flag}"}}); err != nil {
+	if _, err := New(config.Config{Backend: "command", Command: []string{"prog", "{mono_flag}"}}, ""); err != nil {
 		t.Error(err)
 	}
 }
