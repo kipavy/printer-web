@@ -768,17 +768,23 @@
     try {
       new QRCode($("#qr"), { text: S.cfg.publicURL, width: 116, height: 116, colorDark: "#16191f", colorLight: "#ffffff" });
     } catch (e) { $("#qr").textContent = "QR"; }
+    // A draft handed over by the QR page: show the loading state at once,
+    // the preview can take a while on a slow link.
+    const qp = new URLSearchParams(location.search);
+    const handoff = qp.get("upload");
+    if (handoff) S.uploading = true;
     renderPrinter();
     render();
     await refreshPrinter();
     refreshJobs();
 
-    const qp = new URLSearchParams(location.search);
-    if (qp.get("upload")) {
-      const id = qp.get("upload"), name = qp.get("name") || "affiche-qr.png";
+    if (handoff) {
+      const name = qp.get("name") || "affiche-qr.png";
       history.replaceState(null, "", location.pathname);
-      if (await adoptDraft({ id: id, name: name, kind: qp.get("kind") || "image", pages: 0 })) onPrint();
-      else render();
+      const ok = await adoptDraft({ id: handoff, name: name, kind: qp.get("kind") || "image", pages: 0 });
+      S.uploading = false;
+      render();
+      if (ok) onPrint();
     }
 
     setInterval(() => { if (!document.hidden) refreshPrinter(); }, 10000);
