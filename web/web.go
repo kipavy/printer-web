@@ -6,9 +6,9 @@ import (
 	"io/fs"
 )
 
-// Add new asset directories (for example vendor) to the embed line.
+// Pages, scripts, styles, manifest, icon and the vendored libraries and fonts.
 //
-//go:embed *.html
+//go:embed *.html *.js *.css *.webmanifest *.svg vendor
 var files embed.FS
 
 // FS returns the embedded assets, rooted at the web directory.

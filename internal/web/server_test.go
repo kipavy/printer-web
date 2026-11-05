@@ -22,6 +22,7 @@ import (
 	"github.com/kipavy/printer-web/internal/config"
 	"github.com/kipavy/printer-web/internal/docs"
 	"github.com/kipavy/printer-web/internal/queue"
+	embedded "github.com/kipavy/printer-web/web"
 )
 
 type fakeBackend struct {
@@ -531,6 +532,42 @@ func TestStaticServed(t *testing.T) {
 	}
 	if resp, _ := c.get("/nope.js"); resp.StatusCode != 404 {
 		t.Errorf("missing file: %d", resp.StatusCode)
+	}
+}
+
+// The real embedded front end: pages, scripts, styles, manifest, vendor files and fonts.
+func TestStaticServedEmbedded(t *testing.T) {
+	e := newEnv(t, nil)
+	e.s.assets = embedded.FS()
+	ts := httptest.NewServer(e.s.Handler())
+	t.Cleanup(ts.Close)
+	c := &client{t: t, base: ts.URL}
+	cases := []struct{ path, ctype string }{
+		{"/", "text/html"},
+		{"/qr", "text/html"},
+		{"/app.js", "text/javascript"},
+		{"/i18n.js", "text/javascript"},
+		{"/qr.js", "text/javascript"},
+		{"/app.css", "text/css"},
+		{"/qr.css", "text/css"},
+		{"/manifest.webmanifest", "application/manifest+json"},
+		{"/icon.svg", "image/svg+xml"},
+		{"/vendor/pdf.min.js", "text/javascript"},
+		{"/vendor/pdf.worker.min.js", "text/javascript"},
+		{"/vendor/qrcode.min.js", "text/javascript"},
+		{"/vendor/fonts/BricolageGrotesque-latin.woff2", "font/woff2"},
+		{"/vendor/fonts/AtkinsonHyperlegible-400-latin.woff2", "font/woff2"},
+	}
+	for _, tc := range cases {
+		resp, body := c.get(tc.path)
+		if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), tc.ctype) || len(body) == 0 {
+			t.Errorf("%s: %d %q", tc.path, resp.StatusCode, resp.Header.Get("Content-Type"))
+		}
+	}
+	for _, p := range []string{"/vendor", "/vendor/", "/vendor/fonts"} {
+		if resp, _ := c.get(p); resp.StatusCode != 404 {
+			t.Errorf("%s: %d, want 404", p, resp.StatusCode)
+		}
 	}
 }
 

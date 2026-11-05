@@ -2,10 +2,18 @@ package web
 
 import (
 	"io/fs"
+	"mime"
 	"net/http"
 	"path"
 	"strings"
 )
+
+// Minimal images (scratch, distroless) have no mime.types: register what the UI needs.
+func init() {
+	_ = mime.AddExtensionType(".webmanifest", "application/manifest+json")
+	_ = mime.AddExtensionType(".woff2", "font/woff2")
+	_ = mime.AddExtensionType(".js", "text/javascript; charset=utf-8")
+}
 
 func (s *Server) staticHandler() http.Handler {
 	fsrv := http.FileServerFS(s.assets)
