@@ -46,7 +46,7 @@
     g.imageSmoothingEnabled = true;
     // address, directly under the QR
     g.fillStyle = "#16191f";
-    fit(cfg.publicURL, (s) => '700 ' + s + 'px ui-monospace, Menlo, Consolas, monospace', W - 160, 64);
+    fit(cfg.publicURL, (s) => '700 ' + s + 'px ui-monospace, Menlo, Consolas, monospace', qs, 64);
     g.fillText(cfg.publicURL, W / 2, qy + qs + 100);
     // instruction
     fit(t("qr_scan"), (s) => '700 ' + s + 'px "Atkinson Hyperlegible", system-ui, sans-serif', W - 200, 56);
@@ -55,20 +55,48 @@
     return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("toBlob"))), "image/png"));
   }
 
-  async function printPoster() {
-    const btn = $("#posterBtn");
+  // Draw a small sticker on an A4 page (150 dpi): a 5 cm QR code with the
+  // address under it, never wider than the code, inside a dashed cut line
+  // in the top-left corner.
+  async function drawLabel() {
+    const W = 1240, H = 1754, cm = 150 / 2.54;
+    const qs = Math.round(5 * cm), m = Math.round(1.5 * cm), pad = Math.round(0.7 * cm); // white quiet zone the code needs
+    const c = document.createElement("canvas");
+    c.width = W; c.height = H;
+    const g = c.getContext("2d");
+    g.fillStyle = "#ffffff"; g.fillRect(0, 0, W, H);
+    const qx = m + pad, qy = m + pad;
+    g.imageSmoothingEnabled = false;
+    g.drawImage(qrCanvas, qx, qy, qs, qs);
+    g.imageSmoothingEnabled = true;
+    // address, as wide as the code at most
+    g.fillStyle = "#000000"; g.textAlign = "center"; g.textBaseline = "top";
+    let s = 40;
+    do { g.font = "700 " + s + "px ui-monospace, Menlo, Consolas, monospace"; s -= 1; } while (g.measureText(cfg.publicURL).width > qs && s > 8);
+    const lineH = s + 1;
+    g.fillText(cfg.publicURL, qx + qs / 2, qy + qs + Math.round(0.15 * cm));
+    // dashed cut line around code + address
+    const bw = qs + 2 * pad, bh = qs + Math.round(0.15 * cm) + lineH + 2 * pad;
+    g.strokeStyle = "#9aa0a8"; g.lineWidth = 2; g.setLineDash([12, 8]);
+    g.strokeRect(m, m, bw, bh);
+    return new Promise((res, rej) => c.toBlob((b) => (b ? res(b) : rej(new Error("toBlob"))), "image/png"));
+  }
+
+  async function printPoster(small) {
+    const btn = small ? $("#labelBtn") : $("#posterBtn");
     btn.disabled = true;
     showError("");
     $("#msg").textContent = t("qr_making");
     try {
-      const blob = await drawPoster();
+      const blob = await (small ? drawLabel() : drawPoster());
       const fd = new FormData();
-      fd.append("file", new File([blob], "affiche-qr.png", { type: "image/png" }));
+      const fname = small ? "etiquette-qr.png" : "affiche-qr.png";
+      fd.append("file", new File([blob], fname, { type: "image/png" }));
       const r = await fetch("/api/uploads", { method: "POST", headers: { "X-Requested-With": "printer-web" }, body: fd });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw { key: j.error || "internal" };
       // the main page picks the draft up and asks for the usual confirmation
-      location.href = "./?upload=" + encodeURIComponent(j.id) + "&name=affiche-qr.png&kind=image";
+      location.href = "./?upload=" + encodeURIComponent(j.id) + "&name=" + fname + "&kind=image";
     } catch (e) {
       showError(I18N.errMsg(e && e.key ? e.key : "network"));
       $("#msg").textContent = t("qr_hint");
@@ -92,14 +120,16 @@
       new QRCode($("#qr"), { text: cfg.publicURL, width: 800, height: 800, colorDark: "#000000", colorLight: "#ffffff", correctLevel: QRCode.CorrectLevel.M });
       qrCanvas = $("#qr canvas");
     } catch (e) { qrCanvas = null; }
-    if (!qrCanvas) $("#posterBtn").disabled = true;
-    $("#posterBtn").onclick = printPoster;
+    if (!qrCanvas) { $("#posterBtn").disabled = true; $("#labelBtn").disabled = true; }
+    $("#posterBtn").onclick = () => printPoster(false);
+    $("#labelBtn").onclick = () => printPoster(true);
     $("#browserBtn").onclick = () => window.print();
   }
   // coming back through the back button restores the page with the button disabled
   window.addEventListener("pageshow", (e) => {
     if (!e.persisted) return;
     $("#posterBtn").disabled = !qrCanvas;
+    $("#labelBtn").disabled = !qrCanvas;
     $("#msg").textContent = t("qr_hint");
   });
   init();
