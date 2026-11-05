@@ -34,6 +34,8 @@ const (
 	TypeNoSuchObject   Type = 0x80
 	TypeNoSuchInstance Type = 0x81
 	TypeEndOfMibView   Type = 0x82
+	// TypeUnknown marks an opaque value (see Value.Raw).
+	TypeUnknown Type = 0xff
 )
 
 // PDU types.
@@ -52,11 +54,14 @@ const (
 
 // Value is a decoded variable value. Int holds INTEGER, Counter32, Gauge32
 // and TimeTicks; Bytes holds OCTET STRING and IpAddress; OID holds an OID.
+// A value of an unsupported type, or a malformed one, is kept opaque: Type
+// is TypeUnknown, Raw holds its whole TLV and Bytes its content.
 type Value struct {
 	Type  Type
 	Int   int64
 	Bytes []byte
 	OID   string
+	Raw   []byte
 }
 
 // String returns the value as text.
@@ -191,15 +196,15 @@ func oidBytes(s string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	out := appendBase128(nil, arcs[0]*40+arcs[1])
+	out := appendBase128(nil, uint64(arcs[0])*40+uint64(arcs[1]))
 	for _, a := range arcs[2:] {
-		out = appendBase128(out, a)
+		out = appendBase128(out, uint64(a))
 	}
 	return out, nil
 }
 
-func appendBase128(b []byte, n uint32) []byte {
-	var tmp [5]byte
+func appendBase128(b []byte, n uint64) []byte {
+	var tmp [10]byte
 	i := len(tmp) - 1
 	tmp[i] = byte(n & 0x7f)
 	for n >>= 7; n > 0; n >>= 7 {
@@ -210,6 +215,12 @@ func appendBase128(b []byte, n uint32) []byte {
 }
 
 func encodeValue(v Value) ([]byte, error) {
+	if v.Type == TypeUnknown {
+		if _, _, rest, err := readTLV(v.Raw); err != nil || len(rest) != 0 {
+			return nil, errors.New("snmp: opaque value is not one TLV")
+		}
+		return v.Raw, nil
+	}
 	switch v.Type {
 	case TypeNull, 0:
 		return []byte{tagNull, 0}, nil
@@ -270,21 +281,31 @@ func readTLV(b []byte) (tag byte, content, rest []byte, err error) {
 		return 0, nil, nil, errShort
 	}
 	tag = b[0]
-	if tag&0x1f == 0x1f {
-		return 0, nil, nil, errors.New("snmp: multi-byte tag")
+	i := 1
+	if tag&0x1f == 0x1f { // multi-byte tag: skipped, tag is its first byte
+		for i < len(b) && b[i]&0x80 != 0 {
+			i++
+		}
+		i++
+		if i > 5 {
+			return 0, nil, nil, errors.New("snmp: tag too long")
+		}
+		if i >= len(b) {
+			return 0, nil, nil, errShort
+		}
 	}
-	n := int(b[1])
-	i := 2
+	n := int(b[i])
+	i++
 	if n&0x80 != 0 {
 		k := n & 0x7f
 		if k == 0 || k > 3 {
 			return 0, nil, nil, errors.New("snmp: bad length")
 		}
-		if len(b) < 2+k {
+		if len(b) < i+k {
 			return 0, nil, nil, errShort
 		}
 		n = 0
-		for _, c := range b[2 : 2+k] {
+		for _, c := range b[i : i+k] {
 			n = n<<8 | int(c)
 		}
 		i += k
@@ -474,13 +495,14 @@ func Unmarshal(b []byte) (*Packet, error) {
 		if err != nil {
 			return nil, err
 		}
-		vt, vc, _, err := readTLV(vb)
+		vt, vc, after, err := readTLV(vb)
 		if err != nil {
 			return nil, err
 		}
 		val, err := decodeValue(vt, vc)
-		if err != nil {
-			return nil, err
+		if err != nil { // unsupported or malformed: keep it opaque
+			val = Value{Type: TypeUnknown, Bytes: append([]byte(nil), vc...),
+				Raw: append([]byte(nil), vb[:len(vb)-len(after)]...)}
 		}
 		p.Vars = append(p.Vars, Var{OID: oid, Value: val})
 	}

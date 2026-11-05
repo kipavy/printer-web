@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kipavy/printer-web/internal/snmp"
 )
@@ -27,6 +28,18 @@ type Agent struct {
 	WrongIDFirst atomic.Bool
 	// Requests counts the requests received.
 	Requests atomic.Int32
+	// Delay is waited before each answer (nanoseconds).
+	Delay atomic.Int64
+
+	respond func(req *snmp.Packet) *snmp.Packet // guarded by mu
+}
+
+// SetResponder replaces the default answer; f returns nil to fall back to
+// it.
+func (a *Agent) SetResponder(f func(req *snmp.Packet) *snmp.Packet) {
+	a.mu.Lock()
+	a.respond = f
+	a.mu.Unlock()
 }
 
 // New starts an agent serving vars; it stops when the test ends.
@@ -68,7 +81,19 @@ func (a *Agent) serve() {
 		if err != nil || a.Silent.Load() {
 			continue
 		}
-		resp := a.answer(req)
+		if d := a.Delay.Load(); d > 0 {
+			time.Sleep(time.Duration(d))
+		}
+		a.mu.Lock()
+		f := a.respond
+		a.mu.Unlock()
+		var resp *snmp.Packet
+		if f != nil {
+			resp = f(req)
+		}
+		if resp == nil {
+			resp = a.answer(req)
+		}
 		if a.WrongIDFirst.Load() {
 			_, _ = a.conn.WriteToUDP([]byte{0x30, 0x03, 0x02, 0x01}, from)
 			bad := *resp

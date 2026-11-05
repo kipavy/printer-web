@@ -74,15 +74,31 @@ func (c *Client) id() int32 {
 	return id
 }
 
-func (c *Client) dial(ctx context.Context) (net.Conn, error) {
-	var d net.Dialer
-	return d.DialContext(ctx, "udp", c.addr())
+// Session is one UDP socket to the agent, reused for several requests.
+type Session struct {
+	c    *Client
+	conn net.Conn
+	buf  []byte
 }
 
+// Open creates a session; Close it when done.
+func (c *Client) Open(ctx context.Context) (*Session, error) {
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "udp", c.addr())
+	if err != nil {
+		return nil, err
+	}
+	return &Session{c: c, conn: conn, buf: make([]byte, maxPacketLen)}, nil
+}
+
+// Close closes the socket.
+func (s *Session) Close() error { return s.conn.Close() }
+
 // exchange sends one request and waits for the response with the same
-// request ID, retrying once on timeout. Garbage and mismatched packets are
-// ignored.
-func (c *Client) exchange(ctx context.Context, conn net.Conn, pduType byte, oids []string) (*Packet, error) {
+// request ID and community, retrying on timeout. Garbage and mismatched
+// packets are ignored.
+func (s *Session) exchange(ctx context.Context, pduType byte, oids []string) (*Packet, error) {
+	c := s.c
 	id := c.id()
 	req := &Packet{Version: 0, Community: c.community(), PDUType: pduType, RequestID: id}
 	for _, o := range oids {
@@ -98,25 +114,25 @@ func (c *Client) exchange(ctx context.Context, conn net.Conn, pduType byte, oids
 	}
 	retries := max(c.Retries, 0)
 	// Wake a blocked read when ctx ends.
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	stop := context.AfterFunc(ctx, func() { _ = s.conn.SetDeadline(time.Unix(1, 0)) })
 	defer stop()
-	buf := make([]byte, maxPacketLen)
 	for attempt := 0; attempt <= retries; attempt++ {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
 		dl := time.Now().Add(timeout)
 		if cd, ok := ctx.Deadline(); ok && cd.Before(dl) {
 			dl = cd
 		}
-		if err := conn.SetDeadline(dl); err != nil {
+		if err := s.conn.SetDeadline(dl); err != nil {
 			return nil, err
 		}
-		if _, err := conn.Write(b); err != nil {
+		// After SetDeadline: a cancel that raced with it is not missed.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if _, err := s.conn.Write(b); err != nil {
 			return nil, err
 		}
 		for {
-			n, err := conn.Read(buf)
+			n, err := s.conn.Read(s.buf)
 			if err != nil {
 				if ctx.Err() != nil {
 					return nil, ctx.Err()
@@ -127,8 +143,8 @@ func (c *Client) exchange(ctx context.Context, conn net.Conn, pduType byte, oids
 				}
 				return nil, err
 			}
-			p, err := Unmarshal(buf[:n])
-			if err != nil || p.PDUType != PDUGetResponse || p.RequestID != id || p.Version != 0 {
+			p, err := Unmarshal(s.buf[:n])
+			if err != nil || p.PDUType != PDUGetResponse || p.RequestID != id || p.Version != 0 || p.Community != req.Community {
 				continue
 			}
 			if p.ErrorStatus != 0 {
@@ -140,26 +156,26 @@ func (c *Client) exchange(ctx context.Context, conn net.Conn, pduType byte, oids
 	return nil, ErrTimeout
 }
 
-// Get reads the given OIDs. The result is keyed by OID (without a leading
-// dot). Values that are v2 exceptions are left out.
-func (c *Client) Get(ctx context.Context, oids ...string) (map[string]Value, error) {
-	if len(oids) == 0 {
-		return map[string]Value{}, nil
-	}
-	norm := make([]string, len(oids))
+func normalize(oids []string) ([]string, error) {
+	out := make([]string, len(oids))
 	for i, o := range oids {
 		arcs, err := ParseOID(o)
 		if err != nil {
 			return nil, err
 		}
-		norm[i] = formatOID(arcs)
+		out[i] = formatOID(arcs)
 	}
-	conn, err := c.dial(ctx)
-	if err != nil {
-		return nil, err
+	return out, nil
+}
+
+// Get reads the given OIDs. The result is keyed by OID (without a leading
+// dot). Values that are v2 exceptions are left out.
+func (s *Session) Get(ctx context.Context, oids ...string) (map[string]Value, error) {
+	norm, err := normalize(oids)
+	if err != nil || len(norm) == 0 {
+		return map[string]Value{}, err
 	}
-	defer conn.Close()
-	p, err := c.exchange(ctx, conn, PDUGetRequest, norm)
+	p, err := s.exchange(ctx, PDUGetRequest, norm)
 	if err != nil {
 		return nil, err
 	}
@@ -173,41 +189,86 @@ func (c *Client) Get(ctx context.Context, oids ...string) (map[string]Value, err
 }
 
 // Walk reads the subtree under root with GetNext. It stops at the end of the
-// subtree, at the end of the MIB, or after MaxWalk variables.
-func (c *Client) Walk(ctx context.Context, root string) ([]Var, error) {
-	arcs, err := ParseOID(root)
+// subtree, at the end of the MIB, when the agent does not move forward, or
+// after MaxWalk variables.
+func (s *Session) Walk(ctx context.Context, root string) ([]Var, error) {
+	norm, err := normalize([]string{root})
 	if err != nil {
 		return nil, err
 	}
-	root = formatOID(arcs)
-	conn, err := c.dial(ctx)
+	m, err := s.WalkColumns(ctx, norm[0])
+	return m[norm[0]], err
+}
+
+// WalkColumns walks several subtrees together: each GetNext carries one
+// variable per subtree not yet finished, so a table costs about rows+1
+// requests. The result is keyed by root as given (leading dot removed).
+// MaxWalk bounds the total number of variables.
+func (s *Session) WalkColumns(ctx context.Context, roots ...string) (map[string][]Var, error) {
+	norm, err := normalize(roots)
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
-	var out []Var
-	cur := root
-	for len(out) < MaxWalk {
-		p, err := c.exchange(ctx, conn, PDUGetNextRequest, []string{cur})
+	out := map[string][]Var{}
+	type column struct{ root, cur string }
+	var active []column
+	for _, r := range norm {
+		if _, dup := out[r]; !dup {
+			out[r] = nil
+			active = append(active, column{r, r})
+		}
+	}
+	total := 0
+	for len(active) > 0 && total < MaxWalk {
+		oids := make([]string, len(active))
+		for i, col := range active {
+			oids[i] = col.cur
+		}
+		p, err := s.exchange(ctx, PDUGetNextRequest, oids)
 		if err != nil {
+			// SNMPv1 noSuchName: that variable ran off the end of the MIB.
 			var se *Error
-			if errors.As(err, &se) && se.Status == 2 { // noSuchName: end of MIB
-				return out, nil
+			if errors.As(err, &se) && se.Status == 2 && se.Index >= 1 && se.Index <= int64(len(active)) {
+				active = append(active[:se.Index-1], active[se.Index:]...)
+				continue
 			}
 			return out, err
 		}
-		if len(p.Vars) != 1 {
+		if len(p.Vars) != len(active) {
 			return out, errors.New("snmp: bad GetNext response")
 		}
-		v := p.Vars[0]
-		if v.Value.IsException() || !strings.HasPrefix(v.OID, root+".") {
-			return out, nil
+		next := active[:0]
+		for i, col := range active {
+			v := p.Vars[i]
+			if v.Value.IsException() || !strings.HasPrefix(v.OID, col.root+".") ||
+				CompareOIDs(v.OID, col.cur) <= 0 || total >= MaxWalk {
+				continue // column done
+			}
+			out[col.root] = append(out[col.root], v)
+			total++
+			next = append(next, column{col.root, v.OID})
 		}
-		if CompareOIDs(v.OID, cur) <= 0 { // agent going backwards: stop
-			return out, nil
-		}
-		out = append(out, v)
-		cur = v.OID
+		active = next
 	}
 	return out, nil
+}
+
+// Get opens a session, reads the OIDs and closes it.
+func (c *Client) Get(ctx context.Context, oids ...string) (map[string]Value, error) {
+	s, err := c.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	return s.Get(ctx, oids...)
+}
+
+// Walk opens a session, walks root and closes it.
+func (c *Client) Walk(ctx context.Context, root string) ([]Var, error) {
+	s, err := c.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	return s.Walk(ctx, root)
 }

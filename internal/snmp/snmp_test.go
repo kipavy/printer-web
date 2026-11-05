@@ -264,3 +264,108 @@ func TestParseOID(t *testing.T) {
 		t.Fatal("compare")
 	}
 }
+
+func TestOpaqueValues(t *testing.T) {
+	// A packet with an Opaque (0x44), a malformed INTEGER (9 bytes) and a
+	// multi-byte tag, between two good values.
+	good1 := []byte{0x30, 0x0c, 0x06, 0x08, 0x2b, 6, 1, 2, 1, 1, 1, 0, 0x04, 0x00}
+	oid := []byte{0x06, 0x08, 0x2b, 6, 1, 2, 1, 1, 2, 0}
+	opaque := append(append([]byte{0x30, byte(len(oid) + 4)}, oid...), 0x44, 0x02, 0xab, 0xcd)
+	badInt := append(append([]byte{0x30, byte(len(oid) + 11)}, oid...), 0x02, 0x09, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+	longTag := append(append([]byte{0x30, byte(len(oid) + 5)}, oid...), 0x5f, 0x81, 0x01, 0x01, 0x07)
+	good2 := []byte{0x30, 0x0d, 0x06, 0x08, 0x2b, 6, 1, 2, 1, 1, 3, 0, 0x02, 0x01, 0x05}
+	var list []byte
+	for _, v := range [][]byte{good1, opaque, badInt, longTag, good2} {
+		list = append(list, v...)
+	}
+	pdu := append([]byte{0x02, 0x01, 0x07, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, byte(len(list))}, list...)
+	msg := append([]byte{0x02, 0x01, 0x00, 0x04, 0x06, 'p', 'u', 'b', 'l', 'i', 'c', 0xa2, byte(len(pdu))}, pdu...)
+	b := append([]byte{0x30, byte(len(msg))}, msg...)
+	p, err := snmp.Unmarshal(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.Vars) != 5 || p.Vars[4].Value.Int != 5 || p.Vars[0].Value.Type != snmp.TypeOctetString {
+		t.Fatalf("got %+v", p.Vars)
+	}
+	for i := 1; i <= 3; i++ {
+		if p.Vars[i].Value.Type != snmp.TypeUnknown || len(p.Vars[i].Value.Raw) == 0 {
+			t.Fatalf("var %d: %+v", i, p.Vars[i].Value)
+		}
+	}
+	if out, err := p.Marshal(); err != nil || !bytes.Equal(out, b) {
+		t.Fatalf("re-encode: % x %v", out, err)
+	}
+
+	// Over the wire: the response is used, not dropped as a timeout.
+	a := snmptest.New(t, map[string]snmp.Value{
+		"1.3.6.1.2.1.1.1.0": str("ok"),
+		"1.3.6.1.2.1.1.2.0": {Type: snmp.TypeUnknown, Raw: []byte{0x44, 0x01, 0x00}},
+	})
+	got, err := client(a).Get(context.Background(), "1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.2.0")
+	if err != nil || got["1.3.6.1.2.1.1.1.0"].String() != "ok" || got["1.3.6.1.2.1.1.2.0"].Type != snmp.TypeUnknown {
+		t.Fatalf("got %+v %v", got, err)
+	}
+}
+
+func TestWalkStops(t *testing.T) {
+	a := snmptest.New(t, table)
+	c := client(a)
+	// endOfMibView after one row.
+	a.SetResponder(func(req *snmp.Packet) *snmp.Packet {
+		v := snmp.Value{Type: snmp.TypeEndOfMibView}
+		oid := req.Vars[0].OID
+		if oid == "1.3.6.1.2.1.43.11.1.1.6" {
+			oid, v = oid+".1.1", str("first")
+		}
+		return &snmp.Packet{Community: req.Community, PDUType: snmp.PDUGetResponse, RequestID: req.RequestID,
+			Vars: []snmp.Var{{OID: oid, Value: v}}}
+	})
+	vs, err := c.Walk(context.Background(), "1.3.6.1.2.1.43.11.1.1.6")
+	if err != nil || len(vs) != 1 || vs[0].Value.String() != "first" {
+		t.Fatalf("endOfMibView: %+v %v", vs, err)
+	}
+	// An agent that answers the same OID again: stop, no loop.
+	a.SetResponder(func(req *snmp.Packet) *snmp.Packet {
+		return &snmp.Packet{Community: req.Community, PDUType: snmp.PDUGetResponse, RequestID: req.RequestID,
+			Vars: []snmp.Var{{OID: "1.3.6.1.2.1.43.11.1.1.6.1.1", Value: str("again")}}}
+	})
+	n := a.Requests.Load()
+	vs, err = c.Walk(context.Background(), "1.3.6.1.2.1.43.11.1.1.6")
+	if err != nil || len(vs) != 1 || a.Requests.Load()-n != 2 {
+		t.Fatalf("non-increasing: %+v %v, %d requests", vs, err, a.Requests.Load()-n)
+	}
+}
+
+func TestWalkColumns(t *testing.T) {
+	a := snmptest.New(t, table)
+	s, err := client(a).Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	m, err := s.WalkColumns(context.Background(), "1.3.6.1.2.1.43.11.1.1.6", ".1.3.6.1.2.1.43.11.1.1.8", "1.3.6.1.2.1.43.12.1.1.4", "1.3.6.1.4.1.367")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m["1.3.6.1.2.1.43.11.1.1.6"]) != 3 || len(m["1.3.6.1.2.1.43.11.1.1.8"]) != 3 ||
+		len(m["1.3.6.1.2.1.43.12.1.1.4"]) != 1 || len(m["1.3.6.1.4.1.367"]) != 0 {
+		t.Fatalf("got %+v", m)
+	}
+	// 3 rows + 1, plus one resend for each of the two columns that run off
+	// the end of the MIB (SNMPv1 noSuchName), all on one socket.
+	if n := a.Requests.Load(); n != 6 {
+		t.Fatalf("requests = %d", n)
+	}
+}
+
+func TestCommunityMismatchIgnored(t *testing.T) {
+	a := snmptest.New(t, table)
+	a.SetResponder(func(req *snmp.Packet) *snmp.Packet {
+		return &snmp.Packet{Community: "other", PDUType: snmp.PDUGetResponse, RequestID: req.RequestID,
+			Vars: []snmp.Var{{OID: req.Vars[0].OID, Value: str("x")}}}
+	})
+	if _, err := client(a).Get(context.Background(), "1.3.6.1.2.1.1.1.0"); !errors.Is(err, snmp.ErrTimeout) {
+		t.Fatalf("err = %v", err)
+	}
+}
