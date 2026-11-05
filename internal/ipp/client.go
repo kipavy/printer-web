@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -151,7 +150,12 @@ func NewClient(uri string, insecureTLS bool) *Client {
 	if insecureTLS {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12} //nolint:gosec // user opt-in
 	}
-	return &Client{URI: uri, HTTP: &http.Client{Transport: tr, Timeout: 30 * time.Second}}
+	return &Client{URI: uri, HTTP: &http.Client{
+		Transport: tr,
+		Timeout:   30 * time.Second,
+		// A redirect would turn the POST into a body-less GET: surface it instead.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}}
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -189,8 +193,9 @@ func (c *Client) request(op uint16, extra ...Attr) *Message {
 	}
 }
 
-// do sends req (followed by doc, if any) and returns the decoded response.
-func (c *Client) do(ctx context.Context, hc *http.Client, req *Message, doc io.Reader) (*Message, error) {
+// do sends req followed by doc (if any) of docSize bytes (< 0: unknown, chunked)
+// and returns the decoded response.
+func (c *Client) do(ctx context.Context, hc *http.Client, req *Message, doc io.Reader, docSize int64) (*Message, error) {
 	op := OpName(req.Code)
 	hdr, err := req.MarshalBinary()
 	if err != nil {
@@ -203,22 +208,29 @@ func (c *Client) do(ctx context.Context, hc *http.Client, req *Message, doc io.R
 	body := io.Reader(bytes.NewReader(hdr))
 	size := int64(0)
 	if doc != nil {
+		size = docSize
+		if size >= 0 {
+			doc = &exactReader{r: doc, left: size}
+		}
 		body = io.MultiReader(body, doc)
-		size = docSize(doc)
 	}
 	hr, err := http.NewRequestWithContext(ctx, http.MethodPost, u, body)
 	if err != nil {
 		return nil, fmt.Errorf("ipp: %s: %w", op, err)
 	}
+	hr.ContentLength = -1 // unknown: chunked
 	if size >= 0 {
 		hr.ContentLength = int64(len(hdr)) + size
-	} // else unknown length: chunked
+	}
 	hr.Header.Set("Content-Type", "application/ipp")
 	resp, err := hc.Do(hr)
 	if err != nil {
 		return nil, fmt.Errorf("ipp: %s: %w", op, err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return nil, fmt.Errorf("ipp: %s: printer redirected to %s: use that address in PRINTER_URI", op, resp.Header.Get("Location"))
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("ipp: %s: HTTP %s", op, resp.Status)
 	}
@@ -234,25 +246,6 @@ func (c *Client) do(ctx context.Context, hc *http.Client, req *Message, doc io.R
 		return nil, &StatusError{Op: req.Code, Code: m.Code, Message: msg}
 	}
 	return m, nil
-}
-
-// docSize returns the remaining length of doc, or -1 if unknown.
-func docSize(doc io.Reader) int64 {
-	switch d := doc.(type) {
-	case interface{ Len() int }:
-		return int64(d.Len())
-	case *os.File:
-		fi, err := d.Stat()
-		if err != nil || !fi.Mode().IsRegular() {
-			return -1
-		}
-		off, err := d.Seek(0, io.SeekCurrent)
-		if err != nil || off > fi.Size() {
-			return -1
-		}
-		return fi.Size() - off
-	}
-	return -1
 }
 
 // attrsOf flattens every group with the given tag into a map.
@@ -279,7 +272,7 @@ func (c *Client) GetPrinterAttributes(ctx context.Context, names ...string) (map
 		}
 		extra = append(extra, Attr{Name: "requested-attributes", Tag: TagKeyword, Values: vals})
 	}
-	m, err := c.do(ctx, c.httpClient(), c.request(OpGetPrinterAttributes, extra...), nil)
+	m, err := c.do(ctx, c.httpClient(), c.request(OpGetPrinterAttributes, extra...), nil, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -287,8 +280,12 @@ func (c *Client) GetPrinterAttributes(ctx context.Context, names ...string) (map
 }
 
 // PrintJob streams doc to the printer with the given job template attributes.
-// The HTTP client timeout is not applied (large documents); use ctx instead.
-func (c *Client) PrintJob(ctx context.Context, doc io.Reader, format, jobName string, attrs []Attr) (int, error) {
+//
+// Callers must pass the exact document size: it sets Content-Length, which many
+// printers require. size < 0 means unknown and sends the document chunked, a
+// last resort that many printers reject. The HTTP client timeout is not applied
+// (large documents), so ctx must carry a deadline.
+func (c *Client) PrintJob(ctx context.Context, doc io.Reader, size int64, format, jobName string, attrs []Attr) (int, error) {
 	if format == "" {
 		format = "application/octet-stream"
 	}
@@ -303,7 +300,7 @@ func (c *Client) PrintJob(ctx context.Context, doc io.Reader, format, jobName st
 	}
 	hc := *c.httpClient()
 	hc.Timeout = 0
-	m, err := c.do(ctx, &hc, req, doc)
+	m, err := c.do(ctx, &hc, req, doc, size)
 	if err != nil {
 		return 0, err
 	}
@@ -316,7 +313,7 @@ func (c *Client) PrintJob(ctx context.Context, doc io.Reader, format, jobName st
 
 // GetJobAttributes returns the job's attributes (job-state, job-state-reasons...).
 func (c *Client) GetJobAttributes(ctx context.Context, jobID int) (map[string][]any, error) {
-	m, err := c.do(ctx, c.httpClient(), c.request(OpGetJobAttributes, jobIDAttr(jobID)), nil)
+	m, err := c.do(ctx, c.httpClient(), c.request(OpGetJobAttributes, jobIDAttr(jobID)), nil, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -325,7 +322,7 @@ func (c *Client) GetJobAttributes(ctx context.Context, jobID int) (map[string][]
 
 // CancelJob cancels a job.
 func (c *Client) CancelJob(ctx context.Context, jobID int) error {
-	_, err := c.do(ctx, c.httpClient(), c.request(OpCancelJob, jobIDAttr(jobID)), nil)
+	_, err := c.do(ctx, c.httpClient(), c.request(OpCancelJob, jobIDAttr(jobID)), nil, 0)
 	return err
 }
 
@@ -339,4 +336,65 @@ func firstInt(v []any) (int, bool) {
 	}
 	n, ok := v[0].(int32)
 	return int(n), ok
+}
+
+// exactReader fails unless r yields exactly left bytes. The last byte is held
+// back until EOF is confirmed, so a request with a wrong size never completes
+// (net/http would otherwise silently truncate a longer body).
+type exactReader struct {
+	r    io.Reader
+	left int64
+}
+
+func (e *exactReader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	switch {
+	case e.left == 0:
+		if err := e.probeEOF(); err != nil {
+			return 0, err
+		}
+		return 0, io.EOF
+	case e.left == 1:
+		var b [1]byte
+		if _, err := io.ReadFull(e.r, b[:]); err != nil {
+			return 0, errShortDoc
+		}
+		if err := e.probeEOF(); err != nil {
+			return 0, err
+		}
+		e.left = 0
+		p[0] = b[0]
+		return 1, nil
+	}
+	if int64(len(p)) > e.left-1 {
+		p = p[:e.left-1]
+	}
+	n, err := e.r.Read(p)
+	e.left -= int64(n)
+	if err == io.EOF {
+		return n, errShortDoc
+	}
+	return n, err
+}
+
+var errShortDoc = errors.New("ipp: document shorter than its declared size")
+
+// probeEOF checks that the underlying reader has no more data.
+func (e *exactReader) probeEOF() error {
+	var b [1]byte
+	for range 100 {
+		n, err := e.r.Read(b[:])
+		if n > 0 {
+			return errors.New("ipp: document longer than its declared size")
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return io.ErrNoProgress
 }

@@ -22,6 +22,11 @@ type Job struct {
 	Document []byte
 	State    int // current job-state
 
+	// HTTP framing of the Print-Job request: Content-Length (-1 if absent)
+	// and whether it was sent with Transfer-Encoding: chunked.
+	ContentLength int64
+	Chunked       bool
+
 	script   []int
 	polls    int
 	override bool // state fixed by Cancel-Job or SetJobState
@@ -219,7 +224,7 @@ func (s *Server) Job(id int) (Job, bool) {
 }
 
 func (j *Job) copy() Job {
-	c := Job{ID: j.ID, State: j.State, Document: slices.Clone(j.Document), Attrs: map[string][]any{}}
+	c := Job{ID: j.ID, State: j.State, ContentLength: j.ContentLength, Chunked: j.Chunked, Document: slices.Clone(j.Document), Attrs: map[string][]any{}}
 	for k, v := range j.Attrs {
 		c.Attrs[k] = slices.Clone(v)
 	}
@@ -254,7 +259,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.mu.Lock()
-	resp := s.answer(req, doc)
+	resp := s.answer(req, doc, r)
 	s.mu.Unlock()
 	b, err := resp.MarshalBinary()
 	if err != nil {
@@ -266,7 +271,7 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 // answer builds the response; s.mu is held.
-func (s *Server) answer(req *ipp.Message, doc []byte) *ipp.Message {
+func (s *Server) answer(req *ipp.Message, doc []byte, r *http.Request) *ipp.Message {
 	s.ops[req.Code]++
 	resp := &ipp.Message{Version: req.Version, RequestID: req.RequestID}
 	status := func(code uint16, msg string, groups ...ipp.Group) *ipp.Message {
@@ -310,6 +315,8 @@ func (s *Server) answer(req *ipp.Message, doc []byte) *ipp.Message {
 			attrs[k] = v
 		}
 		j := &Job{ID: len(s.jobs) + 1, Attrs: attrs, Document: doc, script: slices.Clone(s.script)}
+		j.ContentLength = r.ContentLength
+		j.Chunked = slices.Contains(r.TransferEncoding, "chunked")
 		j.State = j.script[0]
 		s.jobs = append(s.jobs, j)
 		return status(ipp.StatusOK, "", s.jobGroup(j))

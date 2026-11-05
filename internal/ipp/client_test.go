@@ -6,8 +6,11 @@ import (
 	"errors"
 	"io"
 	"math/rand"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/kipavy/printer-web/internal/ipp"
@@ -75,20 +78,18 @@ func TestDefaultAttributes(t *testing.T) {
 	}
 }
 
-// onlyReader hides Len() so the client must stream with chunked encoding.
+// onlyReader hides Len() and other optional interfaces of its reader.
 type onlyReader struct{ io.Reader }
 
 func TestPrintJobDeliversBytesAndAttributes(t *testing.T) {
 	doc := make([]byte, 300<<10)
 	rand.New(rand.NewSource(2)).Read(doc)
-	for name, r := range map[string]func() io.Reader{
-		"sized":    func() io.Reader { return bytes.NewReader(doc) },
-		"streamed": func() io.Reader { return onlyReader{bytes.NewReader(doc)} },
-	} {
+	for name, size := range map[string]int64{"sized": int64(len(doc)), "unknown size": -1} {
 		t.Run(name, func(t *testing.T) {
 			s := ipptest.NewServer(t, nil)
 			c := ipp.NewClient(s.URL, false)
-			id, err := c.PrintJob(context.Background(), r(), "application/pdf", "report.pdf", []ipp.Attr{
+			// onlyReader hides Len(): framing must come from size alone.
+			id, err := c.PrintJob(context.Background(), onlyReader{bytes.NewReader(doc)}, size, "application/pdf", "report.pdf", []ipp.Attr{
 				{Name: "copies", Tag: ipp.TagInteger, Values: []any{2}},
 				{Name: "sides", Tag: ipp.TagKeyword, Values: []any{"two-sided-long-edge"}},
 				{Name: "print-color-mode", Tag: ipp.TagKeyword, Values: []any{"monochrome"}},
@@ -104,6 +105,12 @@ func TestPrintJobDeliversBytesAndAttributes(t *testing.T) {
 				t.Fatalf("id=%d jobs=%+v", id, jobs)
 			}
 			j := jobs[0]
+			if size >= 0 && (j.Chunked || j.ContentLength <= size) {
+				t.Fatalf("sized: want Content-Length > %d and no chunking, got %d chunked=%v", size, j.ContentLength, j.Chunked)
+			}
+			if size < 0 && !j.Chunked {
+				t.Fatalf("unknown size: want chunked, got Content-Length %d", j.ContentLength)
+			}
 			if !bytes.Equal(j.Document, doc) {
 				t.Fatalf("document differs: %d bytes vs %d", len(j.Document), len(doc))
 			}
@@ -135,7 +142,7 @@ func TestJobStatesPolled(t *testing.T) {
 	s := ipptest.NewServer(t, nil)
 	c := ipp.NewClient(s.URL, false)
 	ctx := context.Background()
-	id, err := c.PrintJob(ctx, strings.NewReader("hello"), "application/octet-stream", "a.txt", nil)
+	id, err := c.PrintJob(ctx, strings.NewReader("hello"), 5, "application/octet-stream", "a.txt", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +168,7 @@ func TestScriptedJobStates(t *testing.T) {
 	s.SetJobStates(ipp.JobPending, ipp.JobPending, ipp.JobAborted)
 	c := ipp.NewClient(s.URL, false)
 	ctx := context.Background()
-	id, err := c.PrintJob(ctx, strings.NewReader("x"), "application/pdf", "", nil)
+	id, err := c.PrintJob(ctx, strings.NewReader("x"), 1, "application/pdf", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +200,7 @@ func TestCancelJob(t *testing.T) {
 	s := ipptest.NewServer(t, nil)
 	c := ipp.NewClient(s.URL, false)
 	ctx := context.Background()
-	id, err := c.PrintJob(ctx, strings.NewReader("x"), "application/pdf", "x", nil)
+	id, err := c.PrintJob(ctx, strings.NewReader("x"), 1, "application/pdf", "x", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +228,7 @@ func TestErrorStatus(t *testing.T) {
 	c := ipp.NewClient(s.URL, false)
 	ctx := context.Background()
 	s.FailOpN(ipp.OpPrintJob, ipp.StatusBusy, 1)
-	_, err := c.PrintJob(ctx, strings.NewReader("x"), "application/pdf", "x", nil)
+	_, err := c.PrintJob(ctx, strings.NewReader("x"), 1, "application/pdf", "x", nil)
 	var se *ipp.StatusError
 	if !errors.As(err, &se) || se.Code != 0x0507 || se.Op != ipp.OpPrintJob {
 		t.Fatalf("want busy, got %v", err)
@@ -233,7 +240,7 @@ func TestErrorStatus(t *testing.T) {
 		t.Fatal("failed job must not be recorded")
 	}
 	// The failure was one-shot.
-	if _, err := c.PrintJob(ctx, strings.NewReader("x"), "application/pdf", "x", nil); err != nil {
+	if _, err := c.PrintJob(ctx, strings.NewReader("x"), 1, "application/pdf", "x", nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -252,7 +259,7 @@ func TestErrorStatus(t *testing.T) {
 func TestUnsupportedDocumentFormat(t *testing.T) {
 	s := ipptest.NewServer(t, map[string][]any{"document-format-supported": {"application/pdf"}})
 	c := ipp.NewClient(s.URL, false)
-	_, err := c.PrintJob(context.Background(), strings.NewReader("x"), "image/jpeg", "x", nil)
+	_, err := c.PrintJob(context.Background(), strings.NewReader("x"), 1, "image/jpeg", "x", nil)
 	var se *ipp.StatusError
 	if !errors.As(err, &se) || se.Code != ipp.StatusDocumentFormatNotSupported {
 		t.Fatalf("got %v", err)
@@ -282,5 +289,47 @@ func TestIPPS(t *testing.T) {
 	}
 	if _, err := ipp.NewClient(s.URL, false).GetPrinterAttributes(context.Background()); err == nil {
 		t.Fatal("self-signed cert must be rejected without insecureTLS")
+	}
+}
+
+func TestStringsReaderSizedNotChunked(t *testing.T) {
+	s := ipptest.NewServer(t, nil)
+	if _, err := ipp.NewClient(s.URL, false).PrintJob(context.Background(),
+		strings.NewReader("hello"), 5, "application/pdf", "x", nil); err != nil {
+		t.Fatal(err)
+	}
+	if j := s.Jobs()[0]; j.Chunked || string(j.Document) != "hello" {
+		t.Fatalf("job %+v", j)
+	}
+}
+
+func TestRedirectIsAnError(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Redirect(w, r, "https://printer.local/ipp/print", http.StatusMovedPermanently)
+	}))
+	t.Cleanup(srv.Close)
+	uri := "ipp://" + srv.Listener.Addr().String() + "/ipp/print"
+	_, err := ipp.NewClient(uri, false).GetPrinterAttributes(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "redirected to https://printer.local/ipp/print") ||
+		!strings.Contains(err.Error(), "PRINTER_URI") {
+		t.Fatalf("got %v", err)
+	}
+	if n := hits.Load(); n != 1 {
+		t.Fatalf("redirect was followed (%d hits)", n)
+	}
+}
+
+func TestWrongSizeFails(t *testing.T) {
+	s := ipptest.NewServer(t, nil)
+	c := ipp.NewClient(s.URL, false)
+	for _, size := range []int64{3, 10} {
+		if _, err := c.PrintJob(context.Background(), strings.NewReader("hello"), size, "application/pdf", "x", nil); err == nil {
+			t.Errorf("size %d for 5 bytes: want error", size)
+		}
+	}
+	if n := len(s.Jobs()); n != 0 {
+		t.Fatalf("%d jobs recorded from mis-sized requests", n)
 	}
 }
