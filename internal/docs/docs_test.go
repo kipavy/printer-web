@@ -7,7 +7,6 @@ import (
 	"errors"
 	"hash/crc32"
 	"image"
-	"image/color"
 	"image/png"
 	"math"
 	"os"
@@ -170,17 +169,18 @@ func TestEstimateCost(t *testing.T) {
 }
 
 func TestNormalizeArgs(t *testing.T) {
-	got, err := normalizeArgs(KindImage, "in.jpg", "out.pdf", 595.28, 841.89)
-	want := []string{"img2pdf", "--pagesize", "595.28ptx841.89pt", "--fit", "into", "-o", "out.pdf", "in.jpg"}
-	if err != nil || !reflect.DeepEqual(got, want) {
-		t.Fatalf("img: %v %v", got, err)
+	if _, err := normalizeArgs(KindImage, "in.jpg", "out.pdf", 595, 842); err == nil {
+		t.Error("images are converted natively, no argv")
 	}
-	got, _ = normalizeArgs(KindImage, "in.jpg", "out.pdf", 0, 0)
-	if !reflect.DeepEqual(got, []string{"img2pdf", "-o", "out.pdf", "in.jpg"}) {
-		t.Fatalf("img nopaper: %v", got)
+	if !reflect.DeepEqual(tiffArgs("a.tif", "a.pdf"), []string{"tiff2pdf", "-o", "a.pdf", "a.tif"}) {
+		t.Error("tiff argv")
 	}
-	got, _ = normalizeArgs(KindPS, "in.ps", "out.pdf", 612, 792)
-	want = append(gsBase(), "-sDEVICE=pdfwrite", "-sOutputFile=out.pdf", "in.ps")
+	wantFit := append(gsBase(), "-sDEVICE=pdfwrite", "-dFIXEDMEDIA", "-dPDFFitPage", "-dDEVICEWIDTHPOINTS=595.28", "-dDEVICEHEIGHTPOINTS=841.89", "-sOutputFile=o.pdf", "i.pdf")
+	if !reflect.DeepEqual(tiffFitArgs("i.pdf", "o.pdf", 595.28, 841.89), wantFit) {
+		t.Error("tiff fit argv")
+	}
+	got, _ := normalizeArgs(KindPS, "in.ps", "out.pdf", 612, 792)
+	want := append(gsBase(), "-sDEVICE=pdfwrite", "-sOutputFile=out.pdf", "in.ps")
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ps: %v", got)
 	}
@@ -379,20 +379,25 @@ func TestNormalizeWithFakeRunner(t *testing.T) {
 					t.Errorf("bad heif target %s", argv[2])
 				}
 				for _, n := range names {
-					os.WriteFile(filepath.Join(dir, n), []byte("j"), 0o600)
+					w := 5
+					if n == "out-2.jpg" {
+						w = 7
+					}
+					os.WriteFile(filepath.Join(dir, n), testJPEG(t, w, 4), 0o600)
 				}
 			}
 			return nil, nil
 		}
 		heic := write(t, "a.heic", []byte("x"))
-		if _, err := Normalize(context.Background(), heic, KindHEIC, 595, 842, tmp); err != nil {
+		pdf, err := Normalize(context.Background(), heic, KindHEIC, 595, 842, tmp)
+		if err != nil {
 			t.Fatal(err)
 		}
-		if len(calls) != 2 || calls[0][0] != "heif-convert" || calls[1][0] != "img2pdf" {
+		if len(calls) != 1 || calls[0][0] != "heif-convert" {
 			t.Fatalf("heic calls: %v", calls)
 		}
-		if filepath.Base(calls[1][len(calls[1])-1]) != names[len(names)-1] {
-			t.Errorf("img2pdf input: %v", calls[1])
+		if b, _ := os.ReadFile(pdf); !bytes.Contains(b, []byte("/Width 5 ")) || !bytes.HasPrefix(b, []byte("%PDF-")) {
+			t.Errorf("heic output must embed the first JPEG")
 		}
 		if m, _ := filepath.Glob(filepath.Join(tmp, "heic-*")); len(m) != 0 {
 			t.Errorf("heic dir not removed: %v", m)
@@ -544,61 +549,6 @@ func writePNG(t *testing.T, name string, img image.Image) string {
 	return write(t, name, b.Bytes())
 }
 
-func TestFlattenPNG(t *testing.T) {
-	tmp := t.TempDir()
-	rgba := image.NewNRGBA(image.Rect(0, 0, 2, 1))
-	rgba.SetNRGBA(0, 0, color.NRGBA{255, 0, 0, 255})
-	rgba.SetNRGBA(1, 0, color.NRGBA{0, 0, 0, 0}) // transparent
-	in := writePNG(t, "a.png", rgba)
-	out, err := flattenPNG(in, tmp)
-	if err != nil || out == "" {
-		t.Fatalf("got %q %v", out, err)
-	}
-	f, _ := os.Open(out)
-	defer f.Close()
-	img, err := png.Decode(f)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !isOpaque(img) {
-		t.Error("output must be opaque")
-	}
-	if r, g, b, a := img.At(1, 0).RGBA(); r != 0xffff || g != 0xffff || b != 0xffff || a != 0xffff {
-		t.Errorf("transparent pixel = %x %x %x %x, want white", r, g, b, a)
-	}
-	if r, g, b, _ := img.At(0, 0).RGBA(); r != 0xffff || g != 0 || b != 0 {
-		t.Error("opaque pixel changed")
-	}
-	// Fully opaque RGBA and non-PNG files are left alone.
-	op := image.NewRGBA(image.Rect(0, 0, 1, 1))
-	op.Set(0, 0, color.RGBA{1, 2, 3, 255})
-	if out, err := flattenPNG(writePNG(t, "o.png", op), tmp); err != nil || out != "" {
-		t.Errorf("opaque png: %q %v", out, err)
-	}
-	if out, err := flattenPNG(write(t, "j.jpg", []byte{0xFF, 0xD8, 0xFF, 0, 0, 0, 0, 0, 0}), tmp); err != nil || out != "" {
-		t.Errorf("jpeg: %q %v", out, err)
-	}
-}
-
-func TestNormalizeFlattensPNG(t *testing.T) {
-	old := run
-	defer func() { run = old }()
-	var argvs [][]string
-	run = func(ctx context.Context, argv []string) ([]byte, error) { argvs = append(argvs, argv); return nil, nil }
-	tmp := t.TempDir()
-	img := image.NewNRGBA(image.Rect(0, 0, 1, 1))
-	in := writePNG(t, "t.png", img) // fully transparent
-	if _, err := Normalize(context.Background(), in, KindImage, 595, 842, tmp); err != nil {
-		t.Fatal(err)
-	}
-	if len(argvs) != 1 || argvs[0][len(argvs[0])-1] == in {
-		t.Fatalf("img2pdf must read the flattened copy: %v", argvs)
-	}
-	if m, _ := filepath.Glob(filepath.Join(tmp, "flat-*")); len(m) != 0 {
-		t.Errorf("flattened copy not removed: %v", m)
-	}
-}
-
 func chunk(typ string, data []byte) []byte {
 	var b bytes.Buffer
 	binary.Write(&b, binary.BigEndian, uint32(len(data)))
@@ -618,24 +568,6 @@ func ihdrPNG(w, h uint32, colorType byte, extra ...[]byte) []byte {
 		b = append(b, e...)
 	}
 	return append(b, chunk("IDAT", []byte{0})...)
-}
-
-func TestFlattenPNGBounds(t *testing.T) {
-	tmp := t.TempDir()
-	huge := write(t, "huge.png", ihdrPNG(60000, 60000, 6))
-	if out, err := flattenPNG(huge, tmp); err == nil || out != "" || !strings.Contains(err.Error(), "too large") {
-		t.Fatalf("got %q %v", out, err)
-	}
-	// Opaque RGB with a bogus IDAT is returned unchanged without decoding.
-	rgb := write(t, "rgb.png", ihdrPNG(10, 10, 2))
-	if out, err := flattenPNG(rgb, tmp); err != nil || out != "" {
-		t.Fatalf("rgb: %q %v", out, err)
-	}
-	// RGB with tRNS must be decoded (here it fails on the bogus data).
-	trns := write(t, "trns.png", ihdrPNG(10, 10, 2, chunk("tRNS", []byte{0, 0, 0, 0, 0, 0})))
-	if _, err := flattenPNG(trns, tmp); err == nil {
-		t.Error("tRNS PNG must be decoded")
-	}
 }
 
 func TestRunWrapsDeadline(t *testing.T) {

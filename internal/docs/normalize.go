@@ -3,13 +3,7 @@ package docs
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
-	"image"
-	"image/color"
-	"image/draw"
-	"image/png"
-	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -20,8 +14,8 @@ import (
 
 func pt(v float64) string { return strconv.FormatFloat(v, 'f', -1, 64) }
 
-// normalizeArgs builds the argv turning a PS or image file into a PDF.
-// Text and HEIC need several steps and are handled in Normalize.
+// normalizeArgs builds the argv turning a PS file into a PDF.
+// Images, text and HEIC are handled in Normalize.
 func normalizeArgs(k Kind, in, out string, paperW, paperH float64) ([]string, error) {
 	switch k {
 	case KindPS:
@@ -29,14 +23,18 @@ func normalizeArgs(k Kind, in, out string, paperW, paperH float64) ([]string, er
 		// would clip or misplace PostScript that sets its own page size.
 		a := append(gsBase(), "-sDEVICE=pdfwrite")
 		return append(a, "-sOutputFile="+out, in), nil
-	case KindImage:
-		a := []string{"img2pdf"}
-		if paperW > 0 && paperH > 0 {
-			a = append(a, "--pagesize", pt(paperW)+"ptx"+pt(paperH)+"pt", "--fit", "into")
-		}
-		return append(a, "-o", out, in), nil
 	}
 	return nil, fmt.Errorf("no direct conversion for kind %d", k)
+}
+
+// tiffArgs converts a TIFF to PDF with tiff2pdf (libtiff-tools); it keeps the
+// TIFF's own page size, so tiffFitArgs scales the result onto the paper.
+func tiffArgs(in, out string) []string { return []string{"tiff2pdf", "-o", out, in} }
+
+func tiffFitArgs(in, out string, paperW, paperH float64) []string {
+	a := append(gsBase(), "-sDEVICE=pdfwrite", "-dFIXEDMEDIA", "-dPDFFitPage",
+		"-dDEVICEWIDTHPOINTS="+pt(paperW), "-dDEVICEHEIGHTPOINTS="+pt(paperH))
+	return append(a, "-sOutputFile="+out, in)
 }
 
 func heicArgs(in, out string) []string { return []string{"heif-convert", in, out} }
@@ -72,110 +70,6 @@ func toLatin1(b []byte) []byte {
 		}
 	}
 	return out
-}
-
-// maxPNGPixels bounds decoding memory (100 megapixels).
-const maxPNGPixels = 100_000_000
-
-// noAlphaPNG reports whether the PNG (positioned anywhere) is grey or RGB
-// without a tRNS chunk, so it cannot have transparency. Unknown means false.
-func noAlphaPNG(f *os.File) bool {
-	var hdr [26]byte
-	if _, err := f.ReadAt(hdr[:], 0); err != nil {
-		return false
-	}
-	if ct := hdr[25]; ct != 0 && ct != 2 {
-		return false
-	}
-	off := int64(8)
-	for {
-		var ch [8]byte
-		if _, err := f.ReadAt(ch[:], off); err != nil {
-			return false
-		}
-		switch string(ch[4:8]) {
-		case "tRNS":
-			return false
-		case "IDAT":
-			return true
-		}
-		off += 12 + int64(binary.BigEndian.Uint32(ch[:4]))
-	}
-}
-
-// flattenPNG writes an opaque copy of a PNG that has transparency, drawn on
-// white (img2pdf would otherwise emit an alpha channel printers render black).
-// It returns "" when the file needs no change.
-func flattenPNG(in, tmp string) (string, error) {
-	f, err := os.Open(in)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-	var magic [8]byte
-	if _, err := io.ReadFull(f, magic[:]); err != nil || string(magic[:]) != "\x89PNG\r\n\x1a\n" {
-		return "", nil
-	}
-	if _, err := f.Seek(0, 0); err != nil {
-		return "", err
-	}
-	cfg, err := png.DecodeConfig(f)
-	if err != nil {
-		return "", err
-	}
-	if int64(cfg.Width)*int64(cfg.Height) > maxPNGPixels {
-		return "", fmt.Errorf("image too large (%dx%d pixels)", cfg.Width, cfg.Height)
-	}
-	if noAlphaPNG(f) {
-		return "", nil
-	}
-	if _, err := f.Seek(0, 0); err != nil {
-		return "", err
-	}
-	img, err := png.Decode(f)
-	if err != nil {
-		return "", err
-	}
-	if isOpaque(img) {
-		return "", nil
-	}
-	b := img.Bounds()
-	dst := image.NewRGBA(b)
-	draw.Draw(dst, b, image.NewUniform(color.White), image.Point{}, draw.Src)
-	draw.Draw(dst, b, img, b.Min, draw.Over)
-	out, err := tempPath(tmp, "flat-*.png")
-	if err != nil {
-		return "", err
-	}
-	w, err := os.Create(out)
-	if err != nil {
-		removeQuiet(out)
-		return "", err
-	}
-	err = png.Encode(w, dst)
-	if cerr := w.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		removeQuiet(out)
-		return "", err
-	}
-	return out, nil
-}
-
-func isOpaque(img image.Image) bool {
-	if o, ok := img.(interface{ Opaque() bool }); ok {
-		return o.Opaque()
-	}
-	b := img.Bounds()
-	for y := b.Min.Y; y < b.Max.Y; y++ {
-		for x := b.Min.X; x < b.Max.X; x++ {
-			if _, _, _, a := img.At(x, y).RGBA(); a != 0xffff {
-				return false
-			}
-		}
-	}
-	return true
 }
 
 // heicToJPEG converts with heif-convert into a private dir; multi-image files
@@ -217,14 +111,6 @@ func Normalize(ctx context.Context, in string, k Kind, paperW, paperH float64, t
 	}
 	out, _ = filepath.Abs(out)
 	fail := func(err error) (string, error) { removeQuiet(out); return "", err }
-	img := func(src string) error {
-		argv, err := normalizeArgs(KindImage, src, out, paperW, paperH)
-		if err != nil {
-			return err
-		}
-		_, err = run(ctx, argv)
-		return err
-	}
 	switch k {
 	case KindPS:
 		argv, _ := normalizeArgs(k, in, out, paperW, paperH)
@@ -232,16 +118,11 @@ func Normalize(ctx context.Context, in string, k Kind, paperW, paperH float64, t
 			return fail(err)
 		}
 	case KindImage:
-		src := in
-		flat, err := flattenPNG(in, tmp)
-		if err != nil {
-			return fail(err)
-		}
-		if flat != "" {
-			defer removeQuiet(flat)
-			src, _ = filepath.Abs(flat)
-		}
-		if err := img(src); err != nil {
+		if isTIFF(in) {
+			if err := tiffToPDF(ctx, in, out, paperW, paperH, tmp); err != nil {
+				return fail(err)
+			}
+		} else if err := imageToPDF(in, out, paperW, paperH); err != nil {
 			return fail(err)
 		}
 	case KindHEIC:
@@ -250,8 +131,7 @@ func Normalize(ctx context.Context, in string, k Kind, paperW, paperH float64, t
 		if err != nil {
 			return fail(err)
 		}
-		jpg, _ = filepath.Abs(jpg)
-		if err := img(jpg); err != nil {
+		if err := imageToPDF(jpg, out, paperW, paperH); err != nil {
 			return fail(err)
 		}
 	case KindText:
@@ -284,4 +164,25 @@ func Normalize(ctx context.Context, in string, k Kind, paperW, paperH float64, t
 		return fail(ErrUnsupported)
 	}
 	return out, nil
+}
+
+// tiffToPDF runs tiff2pdf, then (when a paper size is known) a Ghostscript
+// pdfwrite pass fitting the page onto the paper, so the print path always
+// gets a PDF that matches the selected sheet. TIFFs stay on a portrait page
+// (no landscape auto-switch: tiff2pdf's page orientation is not inspected).
+func tiffToPDF(ctx context.Context, in, out string, paperW, paperH float64, tmp string) error {
+	if paperW <= 0 || paperH <= 0 {
+		_, err := run(ctx, tiffArgs(in, out))
+		return err
+	}
+	raw, err := tempPath(tmp, "tiff-*.pdf")
+	if err != nil {
+		return err
+	}
+	defer removeQuiet(raw)
+	if _, err := run(ctx, tiffArgs(in, raw)); err != nil {
+		return err
+	}
+	_, err = run(ctx, tiffFitArgs(raw, out, paperW, paperH))
+	return err
 }
