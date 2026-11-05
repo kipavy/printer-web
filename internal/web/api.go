@@ -85,7 +85,7 @@ func paperSize(papers []string) (float64, float64) {
 func cleanName(n string) string {
 	n = filepath.Base(strings.ReplaceAll(n, "\\", "/"))
 	n = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		if unicode.In(r, unicode.Cc, unicode.Cf, unicode.Zl, unicode.Zp) {
 			return -1
 		}
 		return r
@@ -93,8 +93,8 @@ func cleanName(n string) string {
 	if r := []rune(n); len(r) > 120 {
 		n = string(r[:120])
 	}
-	if n == "." || n == "/" {
-		return ""
+	if n == "" || n == "." || n == ".." || n == "/" {
+		return "document"
 	}
 	return n
 }
@@ -316,6 +316,10 @@ func (s *Server) handleEstimate(w http.ResponseWriter, r *http.Request) {
 			cov = append(cov, dr.Coverage[p-1])
 		}
 	}
+	if len(cov) != len(sel) {
+		writeJSON(w, http.StatusOK, out) // no reliable coverage: no cost
+		return
+	}
 	if cost, ok := docs.EstimateCost(cov, sheets, opts.Copies, !opts.Color, s.cfg.Pricing); ok {
 		out["cost"] = cost
 		out["currency"] = s.cfg.Pricing.Currency
@@ -338,6 +342,7 @@ func (s *Server) handleUploadPDF(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("Content-Security-Policy", "sandbox")
 	http.ServeContent(w, r, "", time.Time{}, f)
 }
 

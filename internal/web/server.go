@@ -7,9 +7,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"mime"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -24,7 +27,7 @@ const (
 	csrfHeader   = "X-Requested-With"
 	csrfValue    = "printer-web"
 	toolTimeout  = 2 * time.Minute
-	maxJSONBytes = 1 << 20
+	maxJSONBytes = 64 << 10
 )
 
 // Server serves the API and the embedded front end.
@@ -97,6 +100,15 @@ func newVisitor() string {
 // middleware sets the visitor cookie and enforces the CSRF rules.
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.hostAllowed(r.Host) {
+			writeError(w, http.StatusMisdirectedRequest, "misdirected")
+			return
+		}
+		h := w.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", "no-referrer")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Content-Security-Policy", csp)
 		visitor := ""
 		if c, err := r.Cookie(cookieName); err == nil && validVisitor(c.Value) {
 			visitor = c.Value
@@ -171,9 +183,48 @@ func writeErr(w http.ResponseWriter, err error) {
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBytes)
-	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request")
+	dec := json.NewDecoder(r.Body)
+	err := dec.Decode(v)
+	if err == nil {
+		if _, e2 := dec.Token(); e2 != io.EOF {
+			err = errors.New("trailing data")
+			if isTooLarge(e2) {
+				err = e2
+			}
+		}
+	}
+	if err != nil {
+		writeBodyErr(w, err)
 		return false
 	}
 	return true
+}
+
+const csp = "default-src 'self'; script-src 'self'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; " +
+	"img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; " +
+	"form-action 'self'; frame-ancestors 'none'"
+
+// hostAllowed is a DNS-rebinding guard: only IPs, local names and the
+// PUBLIC_URL host may be used to reach the server.
+func (s *Server) hostAllowed(hostport string) bool {
+	host := hostport
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		host = h
+	}
+	host = strings.ToLower(strings.Trim(host, "[]"))
+	if host == "" {
+		return false
+	}
+	if net.ParseIP(host) != nil || host == "localhost" {
+		return true
+	}
+	for _, suf := range []string{".local", ".lan", ".home.arpa", ".internal"} {
+		if strings.HasSuffix(host, suf) {
+			return true
+		}
+	}
+	if u, err := url.Parse(s.cfg.PublicURL); err == nil && u.Hostname() != "" {
+		return host == strings.ToLower(u.Hostname())
+	}
+	return false
 }

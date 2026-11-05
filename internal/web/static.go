@@ -4,12 +4,20 @@ import (
 	"io/fs"
 	"net/http"
 	"path"
+	"strings"
 )
 
 func (s *Server) staticHandler() http.Handler {
 	fsrv := http.FileServerFS(s.assets)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if p := path.Clean(r.URL.Path); p == "/" || p == "/index.html" {
+		p := path.Clean(r.URL.Path)
+		if p != "/" {
+			if st, err := fs.Stat(s.assets, strings.TrimPrefix(p, "/")); err == nil && st.IsDir() {
+				http.NotFound(w, r)
+				return
+			}
+		}
+		if p == "/" || p == "/index.html" {
 			w.Header().Set("Cache-Control", "no-cache")
 		}
 		fsrv.ServeHTTP(w, r)

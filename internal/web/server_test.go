@@ -461,6 +461,7 @@ func TestVisitorCookieIsolation(t *testing.T) {
 func TestSecureCookieOnTLS(t *testing.T) {
 	e := newEnv(t, nil)
 	req := httptest.NewRequest("GET", "/api/config", nil)
+	req.Host = "printer.local"
 	req.TLS = &tls.ConnectionState{}
 	rec := httptest.NewRecorder()
 	e.s.Handler().ServeHTTP(rec, req)
@@ -515,16 +516,12 @@ func TestStaticServed(t *testing.T) {
 	c := e.client(t)
 	cases := []struct{ path, ctype, cache string }{
 		{"/", "text/html", "no-cache"},
-		{"/index.html", "text/html", "no-cache"},
 		{"/qr", "text/html", ""},
 		{"/app.js", "text/javascript", ""},
 		{"/style.css", "text/css", ""},
 	}
 	for _, tc := range cases {
 		resp, body := c.get(tc.path)
-		if tc.path == "/index.html" && resp.StatusCode == 301 {
-			continue
-		}
 		if resp.StatusCode != 200 || !strings.HasPrefix(resp.Header.Get("Content-Type"), tc.ctype) || len(body) == 0 {
 			t.Errorf("%s: %d %q", tc.path, resp.StatusCode, resp.Header.Get("Content-Type"))
 		}
@@ -534,5 +531,156 @@ func TestStaticServed(t *testing.T) {
 	}
 	if resp, _ := c.get("/nope.js"); resp.StatusCode != 404 {
 		t.Errorf("missing file: %d", resp.StatusCode)
+	}
+}
+
+func TestIndexRedirectAndNoListing(t *testing.T) {
+	e := newEnv(t, nil)
+	e.s.assets = fstest.MapFS{
+		"index.html":     {Data: []byte("x")},
+		"vendor/a.js":    {Data: []byte("x")},
+		"vendor/b.woff2": {Data: []byte("x")},
+	}
+	h := e.s.Handler()
+	for path, want := range map[string]int{"/index.html": 301, "/vendor": 404, "/vendor/": 404, "/vendor/a.js": 200, "/": 200} {
+		req := httptest.NewRequest("GET", path, nil)
+		req.Host = "127.0.0.1:1"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("%s: %d, want %d", path, rec.Code, want)
+		}
+	}
+	req := httptest.NewRequest("GET", "/index.html", nil)
+	req.Host = "127.0.0.1:1"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Header().Get("Location") != "./" {
+		t.Errorf("Location = %q", rec.Header().Get("Location"))
+	}
+}
+
+func TestEstimateNoCostWithoutCoverage(t *testing.T) {
+	e := newEnv(t, nil)
+	e.s.inkCov = func(context.Context, string) ([]docs.Coverage, error) { return nil, errors.New("no gs") }
+	c := e.client(t)
+	_, body := c.upload("a.pdf", "%PDF-1")
+	id := decode(t, body)["id"].(string)
+	resp, body := c.postJSON("/api/estimate", map[string]any{"upload": id, "options": map[string]any{}})
+	m := decode(t, body)
+	if resp.StatusCode != 200 || m["sheets"] != float64(3) {
+		t.Fatalf("estimate: %d %s", resp.StatusCode, body)
+	}
+	if _, has := m["cost"]; has {
+		t.Errorf("cost present without coverage: %s", body)
+	}
+}
+
+func TestSecurityHeaders(t *testing.T) {
+	e := newEnv(t, nil)
+	c := e.client(t)
+	resp, _ := c.get("/api/config")
+	want := map[string]string{
+		"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "X-Frame-Options": "DENY",
+	}
+	for k, v := range want {
+		if resp.Header.Get(k) != v {
+			t.Errorf("%s = %q", k, resp.Header.Get(k))
+		}
+	}
+	if got := resp.Header.Get("Content-Security-Policy"); !strings.Contains(got, "default-src 'self'") || !strings.Contains(got, "frame-ancestors 'none'") {
+		t.Errorf("CSP = %q", got)
+	}
+	_, body := c.upload("a.pdf", "%PDF-1")
+	id := decode(t, body)["id"].(string)
+	resp, _ = c.get("/api/uploads/" + id + "/pdf")
+	if resp.Header.Get("Content-Security-Policy") != "sandbox" || resp.Header.Get("Content-Disposition") != "inline" ||
+		resp.Header.Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("pdf headers = %v", resp.Header)
+	}
+	if len(resp.Header.Values("Content-Security-Policy")) != 1 {
+		t.Errorf("CSP values = %v", resp.Header.Values("Content-Security-Policy"))
+	}
+}
+
+func TestCleanName(t *testing.T) {
+	cases := map[string]string{
+		"a\u202etxt.pdf": "atxt.pdf",
+		"..":             "document",
+		".":              "document",
+		"":               "document",
+		"\x00":           "document",
+		"dir/../x.pdf":   "x.pdf",
+		`C:\tmp\y.pdf`:   "y.pdf",
+	}
+	for in, want := range cases {
+		if got := cleanName(in); got != want {
+			t.Errorf("cleanName(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := []rune(cleanName(strings.Repeat("é", 300))); len(got) != 120 {
+		t.Errorf("length = %d", len(got))
+	}
+}
+
+func TestJSONLimits(t *testing.T) {
+	e := newEnv(t, nil)
+	c := e.client(t)
+	big := `{"upload":"` + strings.Repeat("a", 100<<10) + `"}`
+	req, _ := http.NewRequest("POST", e.ts.URL+"/api/estimate", strings.NewReader(big))
+	req.Header.Set("Content-Type", "application/json")
+	resp, body := c.do(req)
+	if resp.StatusCode != 413 || decode(t, body)["error"] != "too_large" {
+		t.Errorf("big: %d %s", resp.StatusCode, body)
+	}
+	req, _ = http.NewRequest("POST", e.ts.URL+"/api/estimate", strings.NewReader(`{"upload":"x"} {"a":1}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, body = c.do(req)
+	if resp.StatusCode != 400 || decode(t, body)["error"] != "bad_request" {
+		t.Errorf("trailing: %d %s", resp.StatusCode, body)
+	}
+	// unknown fields are allowed (reaches the draft lookup)
+	req, _ = http.NewRequest("POST", e.ts.URL+"/api/estimate", strings.NewReader(`{"upload":"x","future":1}`+"\n"))
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+	resp, _ = c.do(req)
+	if resp.StatusCode != 404 {
+		t.Errorf("charset content type: %d", resp.StatusCode)
+	}
+}
+
+func TestUploadMissingFilePart(t *testing.T) {
+	e := newEnv(t, nil)
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("other", "x")
+	_ = mw.Close()
+	req, _ := http.NewRequest("POST", e.ts.URL+"/api/uploads", &buf)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("X-Requested-With", "printer-web")
+	resp, body := e.client(t).do(req)
+	if resp.StatusCode != 400 || decode(t, body)["error"] != "bad_request" {
+		t.Errorf("got %d %s", resp.StatusCode, body)
+	}
+}
+
+func TestHostGuard(t *testing.T) {
+	e := newEnv(t, func(c *config.Config) { c.PublicURL = "https://print.example.org" })
+	h := e.s.Handler()
+	cases := map[string]int{
+		"192.168.1.50:28431": 200, "[::1]:28431": 200, "localhost:28431": 200, "printer.local": 200,
+		"nas.lan": 200, "x.home.arpa": 200, "svc.internal:80": 200, "print.example.org": 200,
+		"evil.example.com": 421, "evil.example.com:28431": 421, "": 421,
+	}
+	for host, want := range cases {
+		req := httptest.NewRequest("GET", "/api/config", nil)
+		req.Host = host
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("host %q: %d, want %d", host, rec.Code, want)
+		}
+		if want == 421 && !strings.Contains(rec.Body.String(), "misdirected") {
+			t.Errorf("host %q: body %s", host, rec.Body)
+		}
 	}
 }
