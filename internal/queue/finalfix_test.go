@@ -115,3 +115,12 @@ func TestWorkerLogsUnreachable(t *testing.T) {
 		t.Errorf("log = %q", out)
 	}
 }
+
+func TestResolveOrientationMarksAuto(t *testing.T) {
+	if o := resolveOrientation(backend.Options{Orientation: "auto"}, "landscape"); !o.AutoOrientation {
+		t.Error("resolved auto must be flagged")
+	}
+	if o := resolveOrientation(backend.Options{Orientation: "portrait"}, "landscape"); o.AutoOrientation {
+		t.Error("user choice must not be flagged")
+	}
+}

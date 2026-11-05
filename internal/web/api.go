@@ -263,8 +263,10 @@ type jobOptions struct {
 	Color       bool   `json:"color"`
 	Paper       string `json:"paper"`
 	Orientation string `json:"orientation"`
-	Quality     string `json:"quality"`
-	Tray        string `json:"tray"`
+	// OrientationAuto: the client resolved "auto" from the first page.
+	OrientationAuto bool   `json:"orientationAuto"`
+	Quality         string `json:"quality"`
+	Tray            string `json:"tray"`
 }
 
 func (o jobOptions) toBackend() (backend.Options, bool) {
@@ -285,7 +287,8 @@ func (o jobOptions) toBackend() (backend.Options, bool) {
 	}
 	return backend.Options{
 		Copies: copies, Sides: sides, Color: o.Color, Paper: o.Paper,
-		Orientation: o.Orientation, Quality: o.Quality, Tray: o.Tray,
+		Orientation: o.Orientation, AutoOrientation: o.OrientationAuto && o.Orientation != "auto",
+		Quality: o.Quality, Tray: o.Tray,
 	}, true
 }
 

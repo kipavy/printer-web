@@ -75,6 +75,7 @@ func isNetErr(err error) bool {
 func resolveOrientation(o backend.Options, orient string) backend.Options {
 	if (o.Orientation == "" || o.Orientation == "auto") && orient != "" {
 		o.Orientation = orient
+		o.AutoOrientation = true
 	}
 	return o
 }

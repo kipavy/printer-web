@@ -227,7 +227,7 @@
   }
   function optsJSON() {
     const o = S.o, c = S.caps;
-    return { copies: o.copies, sides: c.duplex ? o.sides : "one", color: c.color ? o.color : false, paper: o.paper || "", orientation: orientJSON(), quality: c.quality ? o.quality : "", tray: o.tray || "" };
+    return { copies: o.copies, sides: c.duplex ? o.sides : "one", color: c.color ? o.color : false, paper: o.paper || "", orientation: orientJSON(), orientationAuto: o.orient === "auto", quality: c.quality ? o.quality : "", tray: o.tray || "" };
   }
   function effectiveLandscape() {
     if (S.o.orient === "landscape") return true;

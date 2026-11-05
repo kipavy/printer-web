@@ -891,3 +891,10 @@ func TestCommandDefaultPaper(t *testing.T) {
 		t.Errorf("paper = %q, want empty", got.Paper)
 	}
 }
+
+func TestIPPDerivedOrientationNotSent(t *testing.T) {
+	srv, _, _ := submitIPP(t, []string{"application/pdf"}, Options{Copies: 1, Paper: "A4", Orientation: "landscape", AutoOrientation: true})
+	if _, ok := srv.Jobs()[0].Attrs["orientation-requested"]; ok {
+		t.Error("orientation derived from the page must not be requested again")
+	}
+}

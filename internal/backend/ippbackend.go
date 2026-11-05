@@ -285,7 +285,12 @@ func jobAttrs(o Options, c ippCaps) ([]ipp.Attr, error) {
 		}
 		kw("media", m)
 	}
-	switch o.Orientation {
+	// A page whose orientation came from its own geometry is already right.
+	orient := o.Orientation
+	if o.AutoOrientation {
+		orient = ""
+	}
+	switch orient {
 	case "portrait":
 		a = append(a, ipp.Attr{Name: "orientation-requested", Tag: ipp.TagEnum, Values: []any{3}})
 	case "landscape":

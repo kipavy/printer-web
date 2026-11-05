@@ -61,8 +61,12 @@ type Options struct {
 	Color       bool
 	Paper       string
 	Orientation string // auto | portrait | landscape
-	Quality     string // fast | standard | fine
-	Tray        string
+	// AutoOrientation is true when Orientation was derived from the page
+	// itself rather than chosen by the user: the document already has that
+	// orientation, so IPP must not be asked to rotate it again.
+	AutoOrientation bool
+	Quality         string // fast | standard | fine
+	Tray            string
 }
 
 // Handle identifies a submitted job (ID 0 when the backend cannot track it).
