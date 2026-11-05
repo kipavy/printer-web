@@ -12,7 +12,7 @@ Print from your phone to the family printer: open a web page, pick a file, tap P
 - A shared queue, so everyone sees what is printing and what is waiting
 - Printer status and supplies (toner, paper, covers) when the printer reports them
 - Optional cost estimate per job
-- A printable QR poster so guests can open the page by scanning it
+- A printable QR code (small sticker to cut out, or A4 poster) so guests can open the page by scanning it
 - Works offline: no CDN, every script and font is bundled
 - No accounts, no cloud
 - French and English interface
@@ -155,7 +155,7 @@ How it works: cartridge makers quote yields at 5 % ink coverage per colour. prin
 
 ## QR poster
 
-Open `/qr` (for example `http://<server-ip>:28431/qr`) and tap **Print this poster**. You get a one-page poster with a QR code and the address in text, to stick next to the printer. Set `PUBLIC_URL` first so the code carries the address you want people to use.
+Open `/qr` (for example `http://<server-ip>:28431/qr`) and tap **Print a small sticker to cut out**: a 5 cm QR code with the address underneath (never wider than the code), inside a dashed cut line in the corner of the sheet. **Print this poster (A4)** gives a full-page version instead. Set `PUBLIC_URL` first so the code carries the address you want people to use.
 
 ## Add to home screen
 
